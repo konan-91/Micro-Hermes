@@ -9,14 +9,9 @@ use wst::{Wst, NUM_WORKERS};
 const ITERATIONS_PER_WORKER: u32 = 25;
 
 fn main() {
-    // Map the WST in shared, anonymous memory *before* forking. Linux
-    // guarantees a MAP_SHARED|MAP_ANONYMOUS mapping created before fork()
-    // stays backed by the same physical pages in every child process --
-    // this is the entire "shared memory region" of §4.1, with no named
-    // /dev/shm object and no eBPF map involved. That distinction matters:
-    // it's easy to assume the WST itself must be a BPF map (I made that
-    // mistake before reading the paper closely), but the kernel never
-    // touches it at all.
+    // Map the Worker Status Table (WST) in shared anonymous memory before forking. 
+    // This ensures all child processes share the same physical memory without 
+    // needing an external eBPF map at this stage` (§4.1)`
     let size = size_of::<Wst>();
     let map_ptr = unsafe {
         libc::mmap(
@@ -32,11 +27,8 @@ fn main() {
         panic!("mmap failed: {}", std::io::Error::last_os_error());
     }
 
-    // MAP_ANONYMOUS memory from the kernel comes back zero-filled, and
-    // zero is a valid bit pattern for every field in `Wst` (an
-    // `AtomicI64::new(0)` has the same in-memory representation as a
-    // zeroed i64), so this memory is already a valid `Wst` -- we don't
-    // need to run a constructor over it.
+    // Anonymous memory is zero-filled by default. Since a zeroed i64 
+    // represents a valid initial state for our atomics, we don't need a constructor.
     let wst: &'static Wst = unsafe { &*(map_ptr as *const Wst) };
 
     let mut child_pids = Vec::with_capacity(NUM_WORKERS);
@@ -45,8 +37,8 @@ fn main() {
         match pid {
             -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
             0 => {
-                // Child: become this worker, then exit -- never return
-                // from main() and risk re-running parent-only logic.
+                // Child process: run the worker loop and exit immediately 
+                // to prevent executing parent logic.
                 worker::worker_loop(wst, worker_id, ITERATIONS_PER_WORKER);
                 std::process::exit(0);
             }
@@ -54,7 +46,7 @@ fn main() {
         }
     }
 
-    // Parent: wait for every worker to finish its run.
+    // Parent process: block until all child workers finish.
     for pid in child_pids {
         let mut status = 0;
         unsafe {

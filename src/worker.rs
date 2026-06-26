@@ -1,3 +1,8 @@
+/// Stand-in for the real epoll event loop (Fig. 9). Mimics the paper's instrumentation
+/// hooks: timestamp on loop entry, pending event inc/dec, connection tracking. Worker 0 is
+/// artificially slowed to simulate a CPU-heavy worker the scheduler should route around.
+/// Will be replaced by real TCP + epoll in later on.
+
 use crate::scheduler::{schedule, HANG_THRESHOLD_NS, THETA_RATIO};
 use crate::wst::{now_monotonic_ns, Wst, NUM_WORKERS};
 use std::sync::atomic::Ordering;
@@ -7,8 +12,8 @@ use std::time::Duration;
 /// Simulates a worker's event loop with synthetic workloads to test the scheduler.
 /// 
 /// The `+` lines from Fig. 9 in the Hermes paper are implemented; the surrounding
-/// epoll/accept machinery is replaced with a synthetic workload, so we can test
-/// the scheduler before the eBPF dispatcher exists. 
+/// epoll/accept machinery is replaced with a synthetic workload to test the scheduler
+/// before the eBPF dispatcher exists. 
 pub fn worker_loop(wst: &'static Wst, worker_id: usize, iterations: u32) {
     let slot = wst.slot(worker_id);
 

@@ -1,3 +1,6 @@
+/// Allocates the WST in shared anonymous memory via mmap, forks one child process per worker,
+/// waits for all to finish. There is currently no eBPF or real TCP at this stage
+
 mod scheduler;
 mod worker;
 mod wst;

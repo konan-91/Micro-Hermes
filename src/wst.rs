@@ -1,8 +1,14 @@
+/// Defines the Worker Status Table: a flat array of 64-byte WorkerSlot structs,
+/// each holding three AtomicI64 metrics (loop timestamp, pending events, connections).
+/// Utilises shared memory so that all workers can read/write to the same table, since
+/// each worker needs to run the scheduler itself (separate scheduler architecutre was
+/// rejected as it uses a separate CPU core which is expensive at enterprise scale). 
+
 use std::sync::atomic::AtomicI64;
 
-/// Number of simulated worker processes. 
-/// The Hermes paper scales this to O(10) workers per L7 LB device, 
-/// pinning one per CPU core (§2.1). Kept small here for local testing.
+// Number of simulated worker processes. 
+// The Hermes paper scales this to O(10) workers per L7 LB device, 
+// pinning one per CPU core (§2.1). Kept small here for local testing.
 pub const NUM_WORKERS: usize = 4;
 
 // Tracks per-worker status using the three metrics defined in Hermes §5.2.1 
@@ -60,11 +66,6 @@ impl Wst {
         &self.slots[worker_id]
     }
 }
-
-/// Monotonic clock, shared across all processes on this machine. Unlike
-/// wall-clock time it can't jump backwards (e.g. due to NTP correction),
-/// which matters here because we're comparing timestamps written by
-/// different processes against `now()` read by yet another process.
 
 // Returns the current system time in nanoseconds using a monotonic clock.
 // Monotonic clock starts at system boot and can never jump backwards,

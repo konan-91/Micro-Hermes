@@ -1,83 +1,101 @@
-/// Defines the Worker Status Table: a flat array of 64-byte WorkerSlot structs,
-/// each holding three AtomicI64 metrics (loop timestamp, pending events, connections).
-/// Utilises shared memory so that all workers can read/write to the same table, since
-/// each worker needs to run the scheduler itself (separate scheduler architecutre was
-/// rejected as it uses a separate CPU core which is expensive at enterprise scale). 
+/// Worker Status Table (§4.1, Fig. 10).
+///
+/// Flat array of 64-byte WorkerSlot structs, each holding the three Hermes
+/// metrics (loop timestamp, pending events, connection count) as AtomicI64.
+/// Mapped into shared anonymous memory via mmap before forking so that every
+/// worker process reads and writes the same physical pages without locks.
+///
+/// Note: this table is purely for userspace scheduling.  The eBPF maps
+/// (MSel, Msocket) that synchronise results to the kernel come in Phase 2.
 
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-// Number of simulated worker processes. 
-// The Hermes paper scales this to O(10) workers per L7 LB device, 
-// pinning one per CPU core (§2.1). Kept small here for local testing.
+/// Number of simulated worker processes.
+/// Hermes pins one worker per CPU core (§2.1); kept small for local testing.
 pub const NUM_WORKERS: usize = 4;
 
-// Tracks per-worker status using the three metrics defined in Hermes §5.2.1 
-// and Figure 10: Time, Event, and Conn.
-// 
-// Lock-free design (§5.3.1): Each field is an independent AtomicI64. 
-// Workers update their own slots, and the scheduler reads them without locks. 
-// A race condition only results in slightly stale data, which has a negligible 
-// impact on scheduling decisions.
-#[repr(C)] // Fix struct layout and ensure blocks placed one after the other.
+/// Per-worker slot — exactly one CPU cache line (64 bytes).
+///
+/// Lock-free design (§5.3.1): each worker owns its own slot and is the only
+/// writer; the scheduler reads all slots without a lock.  A transient race
+/// yields slightly stale data, which has negligible impact on decisions.
+#[repr(C)]
 pub struct WorkerSlot {
+    /// Timestamp (ns, CLOCK_MONOTONIC) of the most recent loop entry.
+    /// Written at the top of every epoll iteration (Fig. 9 line 12).
+    /// Used by Stage-1 hang detection: if `now - last_loop_entry > threshold`
+    /// the worker is considered stuck.
     pub last_loop_entry: AtomicI64,
+
+    /// Number of events currently being processed (pending_events / "busy").
+    /// Incremented by the event batch size after epoll_wait (line 14),
+    /// decremented by 1 for each processed event (line 18).
     pub pending_events: AtomicI64,
+
+    /// Accumulated (concurrent) connection count ("conn").
+    /// Incremented on accept (line 25), decremented on close (line 37).
     pub accumulated_conns: AtomicI64,
 
-    // Pad the struct to exactly 64 bytes to match the CPU cache line size.
-    // Without this, the memory layout would be contiguous and multiple
-    // WorkerSlot elements would share the same cache line. Concurrent
-    // updates to these neighboring slots would cause false sharing,
-    // where cores redundantly invalidate each other's cache lines and
-    // force expensive reloads from RAM (now one line per struct).
-    _pad: [u8; 64 - 3 * std::mem::size_of::<i64>()],
+    /// Padding to reach exactly 64 bytes, preventing false sharing between
+    /// adjacent slots when multiple cores write concurrently.
+    _pad: [u8; 64 - 3 * std::mem::size_of::<AtomicI64>()],
 }
 
 impl WorkerSlot {
-    // This function is not explicitly called because our shared memory (via mmap) 
-    // is automatically zero-initialized by the operating system. It is kept here 
-    // to explicitly document that a zero-filled memory block is the correct, 
-    // valid starting state for this struct.
+    /// Canonical zero state — matches what mmap MAP_ANONYMOUS gives us.
+    /// Kept for documentation; the OS zero-fills the mapping automatically.
     #[allow(dead_code)]
     pub const fn new() -> Self {
         Self {
             last_loop_entry: AtomicI64::new(0),
             pending_events: AtomicI64::new(0),
             accumulated_conns: AtomicI64::new(0),
-            _pad: [0u8; 64 - 3 * std::mem::size_of::<i64>()],
+            _pad: [0u8; 64 - 3 * std::mem::size_of::<AtomicI64>()],
+        }
+    }
+
+    /// Snapshot all three metrics atomically enough for scheduling purposes.
+    /// No cross-field atomicity guarantee is needed — see §5.3.1 argument.
+    pub fn snapshot(&self) -> WorkerSnapshot {
+        WorkerSnapshot {
+            last_loop_entry: self.last_loop_entry.load(Ordering::Relaxed),
+            pending_events: self.pending_events.load(Ordering::Relaxed),
+            accumulated_conns: self.accumulated_conns.load(Ordering::Relaxed),
         }
     }
 }
 
-// The Worker Status Table (WST) from Hermes §4.1.
-// This structure holds the array of padded worker slots. It is mapped into 
-// shared memory (MAP_SHARED) so that separate, isolated worker processes 
-// can read and write to the exact same physical memory space without locks.
-// Note: This table is purely for userspace metrics; the Linux kernel and 
-// eBPF network maps do not interact with this structure.
+/// Point-in-time copy of a worker's metrics, used by the scheduler.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkerSnapshot {
+    pub last_loop_entry: i64,
+    pub pending_events: i64,
+    pub accumulated_conns: i64,
+}
+
+/// The WST — array of padded worker slots (§4.1).
 #[repr(C)]
 pub struct Wst {
     pub slots: [WorkerSlot; NUM_WORKERS],
 }
 
 impl Wst {
-    // Helper function to easily look up a specific worker's slot by its ID.
+    #[inline]
     pub fn slot(&self, worker_id: usize) -> &WorkerSlot {
         &self.slots[worker_id]
     }
+
+    /// Snapshot the entire table in one pass.  Called by the scheduler at
+    /// the end of each epoll iteration (Fig. 9 line 20 → Algorithm 1).
+    pub fn snapshot_all(&self) -> [WorkerSnapshot; NUM_WORKERS] {
+        std::array::from_fn(|i| self.slots[i].snapshot())
+    }
 }
 
-// Returns the current system time in nanoseconds using a monotonic clock.
-// Monotonic clock starts at system boot and can never jump backwards,
-// unlike network clocks, which guarantees safe & accurate time intervals 
-// when comparing timestamps. 
+/// Current monotonic time in nanoseconds (CLOCK_MONOTONIC).
+/// Never jumps backwards, safe for computing intervals.
 pub fn now_monotonic_ns() -> i64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }

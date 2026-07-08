@@ -29,3 +29,7 @@ Desktop.ini
 # Keep your local secrets out of GitHub
 .env
 .env*.local
+
+# --- Generated benchmark output ---
+*.csv
+results/

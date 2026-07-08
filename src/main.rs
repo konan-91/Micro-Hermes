@@ -1,36 +1,46 @@
-/// Micro-Hermes Phase 1: userspace simulation of the Hermes load balancer.
-///
-/// Allocates the WST in shared anonymous memory, forks one worker process per
-/// slot, runs the configurable workload, and writes metrics.csv on exit.
-///
-/// No eBPF or real TCP at this stage.  The dispatcher is a pure-Rust
-/// simulation of Algorithm 2.  Phase 2 will replace it with a real eBPF
-/// kernel module attached via SO_ATTACH_REUSEPORT_EBPF.
-///
-/// Environment variables:
-///   WORKLOAD_CASE  — 1|2|3|4|default (default: "default")
-///   POLICY         — hermes|lifo|reuseport (default: "hermes")
-///   METRICS_PATH   — path for CSV output (default: "metrics.csv")
+//! Micro-Hermes Phase 1: userspace simulation of the Hermes load balancer.
+//!
+//! Process layout mirrors the real system's division of labor:
+//!   parent  = kernel stand-in — paces connection arrivals (workload CPS),
+//!             runs the dispatch mechanism under test (Algorithm 2 /
+//!             reuseport hash / epoll-exclusive LIFO), pushes each
+//!             connection into the chosen worker's accept queue.
+//!   children = one forked worker per slot, each running the instrumented
+//!             event loop (Fig. 9) and — under the Hermes policy — the
+//!             Algorithm-1 scheduler that feeds the M_Sel bitmap back.
+//!
+//! All cross-process state (WST, M_Sel, accept queues) lives in one
+//! mmap(MAP_SHARED | MAP_ANONYMOUS) region — see shm.rs.
+//!
+//! Environment variables:
+//!   POLICY         — hermes|lifo|reuseport            (default: hermes)
+//!   WORKLOAD_CASE  — 1|2|3|4|default                  (default: default)
+//!   METRICS_PATH   — per-iteration tick CSV           (default: metrics.csv)
+//!   CONNS_PATH     — per-connection latency CSV       (default: conns.csv)
+//!   VERBOSE        — 1 to print every worker loop iteration
 
 mod dispatcher;
+mod generator;
 mod metrics;
 mod scheduler;
+mod shm;
 mod worker;
 mod workload;
 mod wst;
 
-use metrics::MetricsAccumulator;
-use scheduler::Policy;
-use std::mem::size_of;
-use std::ptr;
+use dispatcher::Policy;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use workload::{WorkloadCase, WorkloadConfig};
-use wst::{Wst, NUM_WORKERS};
+use wst::NUM_WORKERS;
 
 fn main() {
     // ── Parse environment config ───────────────────────────────────────────
     let case_str = std::env::var("WORKLOAD_CASE").unwrap_or_else(|_| "default".to_string());
     let policy_str = std::env::var("POLICY").unwrap_or_else(|_| "hermes".to_string());
     let metrics_path = std::env::var("METRICS_PATH").unwrap_or_else(|_| "metrics.csv".to_string());
+    let conns_path = std::env::var("CONNS_PATH").unwrap_or_else(|_| "conns.csv".to_string());
+    let verbose = std::env::var("VERBOSE").map(|v| v == "1").unwrap_or(false);
 
     let policy = match policy_str.as_str() {
         "lifo" => Policy::Lifo,
@@ -38,143 +48,108 @@ fn main() {
         _ => Policy::Hermes,
     };
 
-    let workload_case: Option<WorkloadCase> = match case_str.as_str() {
-        "1" => Some(WorkloadCase::Case1),
-        "2" => Some(WorkloadCase::Case2),
-        "3" => Some(WorkloadCase::Case3),
-        "4" => Some(WorkloadCase::Case4),
-        _ => None, // "default" → original per-worker config
+    let config = match case_str.as_str() {
+        "1" => WorkloadConfig::for_case(WorkloadCase::Case1),
+        "2" => WorkloadConfig::for_case(WorkloadCase::Case2),
+        "3" => WorkloadConfig::for_case(WorkloadCase::Case3),
+        "4" => WorkloadConfig::for_case(WorkloadCase::Case4),
+        _ => WorkloadConfig::default_case(),
     };
 
     eprintln!(
-        "[main] policy={policy_str} workload={case_str} metrics={metrics_path}"
+        "[main] policy={} case={case_str} cps={} duration={:?} → {metrics_path}, {conns_path}",
+        policy.as_str(),
+        config.cps,
+        config.duration,
     );
 
-    // ── Allocate WST in shared anonymous memory ────────────────────────────
-    // MAP_SHARED | MAP_ANONYMOUS: after fork(), parent and all children share
-    // the same physical pages.  This is the inter-process WST from §4.1 /
-    // §5.3.1 — no IPC, no pipes, just direct shared memory reads/writes.
-    let wst_size = size_of::<Wst>();
-    let wst_ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            wst_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if wst_ptr == libc::MAP_FAILED {
-        panic!("mmap WST failed: {}", std::io::Error::last_os_error());
-    }
-    // Safety: MAP_ANONYMOUS is always zero-filled by the OS, matching the
-    // zero-state of WorkerSlot::new().  The 'static lifetime is safe because
-    // the mapping outlives all forked children (we waitpid before munmap).
-    let wst: &'static Wst = unsafe { &*(wst_ptr as *const Wst) };
+    // ── Shared state + per-worker metrics shard files ──────────────────────
+    let shared = shm::mmap_shared_state();
 
-    // ── Allocate MetricsAccumulator in shared memory ───────────────────────
-    // Each worker pushes rows; parent flushes to CSV after all children exit.
-    // We use a second mmap'd region so the Mutex and Vec are in shared memory.
-    //
-    // NOTE: Using a Mutex across fork boundaries is safe here because:
-    //   (a) we only lock from child processes (one per worker, no contention
-    //       between parent and children on the metrics lock), and
-    //   (b) the parent never touches the accumulator until after waitpid.
-    //
-    // In a production system you'd use a lock-free ring buffer; for a
-    // dissertation demo this is fine.
-    let acc_size = size_of::<MetricsAccumulator>();
-    let acc_ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            acc_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if acc_ptr == libc::MAP_FAILED {
-        panic!("mmap MetricsAccumulator failed: {}", std::io::Error::last_os_error());
+    let shard_dir = std::env::temp_dir().join(format!("micro_hermes_shards_{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&shard_dir) {
+        panic!("failed to create metrics shard dir {shard_dir:?}: {e}");
     }
-    // Construct the accumulator in-place in the shared region.
-    let accumulator: &'static MetricsAccumulator = unsafe {
-        let acc = acc_ptr as *mut MetricsAccumulator;
-        std::ptr::write(acc, MetricsAccumulator::new());
-        &*acc
-    };
+    let tick_shards: Vec<PathBuf> =
+        (0..NUM_WORKERS).map(|i| shard_dir.join(format!("w{i}_ticks.csv"))).collect();
+    let conn_shards: Vec<PathBuf> =
+        (0..NUM_WORKERS).map(|i| shard_dir.join(format!("w{i}_conns.csv"))).collect();
 
     // ── Fork one child per worker ──────────────────────────────────────────
     let mut child_pids = Vec::with_capacity(NUM_WORKERS);
-
     for worker_id in 0..NUM_WORKERS {
-        let config = match workload_case {
-            Some(case) => WorkloadConfig::for_case(case, worker_id),
-            None => WorkloadConfig::default_for_worker(worker_id),
-        };
-
         let pid = unsafe { libc::fork() };
         match pid {
             -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
             0 => {
-                // ── Child process ─────────────────────────────────────────
-                worker::worker_loop(wst, worker_id, config, policy, Some(accumulator));
+                worker::worker_loop(
+                    shared,
+                    worker_id,
+                    config.hang,
+                    policy,
+                    &tick_shards[worker_id],
+                    &conn_shards[worker_id],
+                    verbose,
+                );
                 std::process::exit(0);
             }
             child_pid => child_pids.push(child_pid),
         }
     }
 
-    // ── Parent: wait for all children ─────────────────────────────────────
+    // ── Parent: generate traffic (kernel stand-in), then reap children ─────
+    let gen_stats = generator::run(shared, &config, policy);
     for pid in &child_pids {
         let mut status = 0i32;
         unsafe { libc::waitpid(*pid, &mut status, 0) };
     }
 
-    // ── Flush metrics CSV ─────────────────────────────────────────────────
-    if let Err(e) = accumulator.flush_csv(&metrics_path) {
-        eprintln!("[main] failed to write CSV: {e}");
+    // ── Merge metrics shards ────────────────────────────────────────────────
+    match metrics::merge_shards(&tick_shards, &metrics_path, &metrics::tick_header()) {
+        Ok(rows) => eprintln!("[metrics] {} tick rows → {metrics_path}", rows.len()),
+        Err(e) => eprintln!("[main] failed to write tick CSV: {e}"),
     }
-
-    // ── Print summary ─────────────────────────────────────────────────────
-    let final_conns: Vec<i64> = (0..NUM_WORKERS)
-        .map(|i| {
-            wst.slot(i)
-                .accumulated_conns
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
-        .collect();
-    let final_events: Vec<i64> = (0..NUM_WORKERS)
-        .map(|i| {
-            wst.slot(i)
-                .pending_events
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
-        .collect();
-
-    println!("\n── Final WST state ────────────────────────────────────");
-    for i in 0..NUM_WORKERS {
-        println!("  worker {i}: conns={:>3}  pending_events={:>3}", final_conns[i], final_events[i]);
-    }
-
-    let conn_mean = final_conns.iter().sum::<i64>() as f64 / NUM_WORKERS as f64;
-    let conn_sd = {
-        let var = final_conns
-            .iter()
-            .map(|&c| (c as f64 - conn_mean).powi(2))
-            .sum::<f64>()
-            / NUM_WORKERS as f64;
-        var.sqrt()
+    let conn_lines = match metrics::merge_shards(&conn_shards, &conns_path, &metrics::conn_header()) {
+        Ok(rows) => {
+            eprintln!("[metrics] {} conn rows → {conns_path}", rows.len());
+            rows
+        }
+        Err(e) => {
+            eprintln!("[main] failed to write conn CSV: {e}");
+            Vec::new()
+        }
     };
-    println!("  conn SD = {conn_sd:.2}  (lower is better balanced; Fig. 13 target)");
-    println!("  policy  = {policy_str}");
-    println!("  metrics → {metrics_path}");
-    println!("──────────────────────────────────────────────────────\n");
+    let _ = std::fs::remove_dir_all(&shard_dir);
 
-    // ── Cleanup mmap regions ──────────────────────────────────────────────
-    unsafe {
-        libc::munmap(wst_ptr, wst_size);
-        libc::munmap(acc_ptr, acc_size);
+    // ── Summary ─────────────────────────────────────────────────────────────
+    let summary = metrics::summarize_conns(&conn_lines);
+    let final_open: Vec<i64> = (0..NUM_WORKERS)
+        .map(|i| shared.wst.slot(i).accumulated_conns.load(Ordering::Relaxed))
+        .collect();
+    let dropped: Vec<u64> =
+        (0..NUM_WORKERS).map(|i| shared.drops[i].load(Ordering::Relaxed)).collect();
+    let completed: Vec<i64> =
+        summary.completed_per_worker.iter().map(|&c| c as i64).collect();
+
+    println!("\n── Run summary ({} / case {case_str}) ─────────────────────", policy.as_str());
+    println!("  generated={}  completed={}  dropped={}", gen_stats.generated, summary.completed, gen_stats.dropped);
+    for i in 0..NUM_WORKERS {
+        println!(
+            "  worker {i}: dispatched={:>5}  completed={:>5}  open_at_exit={:>4}  dropped={:>4}",
+            gen_stats.dispatched_per_worker[i], completed[i], final_open[i], dropped[i]
+        );
     }
+    println!(
+        "  balance: completed SD = {:.2}   open-conn SD = {:.2}  (lower = better, Fig. 13)",
+        metrics::std_dev(&completed),
+        metrics::std_dev(&final_open),
+    );
+    println!(
+        "  latency (arrival→done): mean = {:.1}ms  p50 = {:.1}ms  p99 = {:.1}ms  max = {:.1}ms",
+        summary.mean_us / 1_000.0,
+        summary.p50_us as f64 / 1_000.0,
+        summary.p99_us as f64 / 1_000.0,
+        summary.max_us as f64 / 1_000.0,
+    );
+    println!("──────────────────────────────────────────────────────────\n");
 }

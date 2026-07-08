@@ -1,108 +1,162 @@
-/// Dispatcher — userspace simulation of Algorithm 2 (§5.4).
-///
-/// In the real Hermes system the kernel eBPF module reads the MSel bitmap and
-/// uses reciprocal_scale + FindNthNonZeroBit to pick a worker for each new
-/// TCP connection (Algo. 2).  In Phase 1 there are no real sockets, so we
-/// replicate that logic in pure Rust.
-///
-/// The dispatcher is called by the workload generator each time it wants to
-/// "send" a synthetic connection; it returns the worker ID that would receive
-/// the connection according to the current bitmap and the active policy.
+//! Dispatcher — the simulated kernel side of connection dispatch.
+//!
+//! Runs in the generator (parent) process, standing in for the kernel: for
+//! each new connection it decides which worker's accept queue receives it.
+//!
+//! Three mechanisms, matching the paper's comparison set:
+//!   • Hermes    — Algorithm 2 (§5.4): read the M_Sel bitmap, reciprocal_scale
+//!                 the 4-tuple hash into the candidate count, pick the Nth set
+//!                 bit. In Phase 2 `dispatch_hermes` is ported to eBPF
+//!                 (attached via SO_ATTACH_REUSEPORT_EBPF) — it is written
+//!                 loop-bounded and Vec-free so the port is mechanical.
+//!   • Reuseport — the kernel's default: stateless hash over all workers.
+//!   • Lifo      — models epoll-exclusive wakeup (see dispatch_lifo).
+//!
+//! In Phase 2 the two baselines are not code we write at all — they are the
+//! kernel's own EPOLLEXCLUSIVE / SO_REUSEPORT behavior; only the Hermes path
+//! survives as an eBPF program.
 
-use crate::scheduler::{bitmap_to_candidates, Policy, ScheduleResult};
+use crate::shm::SharedState;
 use crate::wst::NUM_WORKERS;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-/// Simulated kernel dispatcher — mirrors Algo. 2.
-///
-/// `conn_hash` is a synthetic 4-tuple hash value (the dispatcher uses the
-/// pre-computed kernel hash in the real system, §5.4 line 5).
-pub fn dispatch(result: &ScheduleResult, conn_hash: u64, policy: Policy) -> usize {
+/// Which dispatch mechanism is under test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Full Hermes: Algorithm 1 in workers + Algorithm 2 here.
+    Hermes,
+    /// Baseline: epoll-exclusive-style LIFO wakeup.
+    Lifo,
+    /// Baseline: SO_REUSEPORT stateless 4-tuple hash.
+    ReuseportHash,
+}
+
+impl Policy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Policy::Hermes => "hermes",
+            Policy::Lifo => "lifo",
+            Policy::ReuseportHash => "reuseport",
+        }
+    }
+}
+
+/// Pick the worker that receives `conn`. Called once per new connection.
+pub fn dispatch(shared: &SharedState, policy: Policy, conn_hash: u64) -> usize {
     match policy {
-        Policy::Hermes => dispatch_hermes(result.bitmap, conn_hash),
-        Policy::Lifo => dispatch_lifo(result.bitmap),
-        Policy::ReuseportHash => dispatch_reuseport_hash(conn_hash),
+        Policy::Hermes => dispatch_hermes(shared.msel.load(), conn_hash),
+        Policy::Lifo => dispatch_lifo(shared),
+        Policy::ReuseportHash => reuseport_hash(conn_hash),
     }
 }
 
-/// Hermes dispatch: scale hash into [0, n) then find the Nth set bit.
-/// Mirrors Algo. 2 lines 3-6.
+/// Algorithm 2 (§5.4). Written eBPF-portable: no heap, bounded loop.
+///
+/// Fallback rule from the paper: if the candidate count n ≤ 1 the kernel
+/// keeps the default reuseport hash (a single candidate would concentrate
+/// all connections arriving between scheduler updates onto one worker).
 fn dispatch_hermes(bitmap: u64, conn_hash: u64) -> usize {
-    let candidates = bitmap_to_candidates(bitmap);
-    let n = candidates.len();
-
-    if n == 0 {
-        // Fallback: reuseport-style hash when no candidates (§5.3.2).
-        return dispatch_reuseport_hash(conn_hash);
+    let n = bitmap.count_ones();
+    if n <= 1 {
+        return reuseport_hash(conn_hash);
     }
-
-    // reciprocal_scale equivalent: map hash uniformly into [0, n).
-    let nth = (conn_hash % n as u64) as usize;
-    candidates[nth]
+    let nth = reciprocal_scale(conn_hash, n);
+    find_nth_set_bit(bitmap, nth)
 }
 
-/// LIFO baseline: always pick the single highest-ID bit in the bitmap.
-fn dispatch_lifo(bitmap: u64) -> usize {
-    if bitmap == 0 {
-        return NUM_WORKERS - 1;
+/// The kernel's reciprocal_scale(): maps a 32-bit hash uniformly into
+/// [0, n) with one multiply and one shift — no modulo (include/linux/kernel.h).
+fn reciprocal_scale(hash: u64, n: u32) -> u32 {
+    (((hash as u32 as u64) * n as u64) >> 32) as u32
+}
+
+/// Position of the Nth (0-based) set bit. Caller guarantees nth < popcount.
+fn find_nth_set_bit(bitmap: u64, nth: u32) -> usize {
+    let mut seen = 0u32;
+    for i in 0..NUM_WORKERS {
+        if bitmap & (1u64 << i) != 0 {
+            if seen == nth {
+                return i;
+            }
+            seen += 1;
+        }
     }
-    // Highest set bit = most-recently-active worker (LIFO bias).
-    63 - bitmap.leading_zeros() as usize
+    // Unreachable when the caller upholds nth < popcount; be safe anyway.
+    NUM_WORKERS - 1
 }
 
-/// Reuseport baseline: stateless hash across all workers, ignores bitmap.
-fn dispatch_reuseport_hash(conn_hash: u64) -> usize {
-    (conn_hash % NUM_WORKERS as u64) as usize
+/// SO_REUSEPORT baseline: stateless hash, no awareness of worker state.
+fn reuseport_hash(conn_hash: u64) -> usize {
+    reciprocal_scale(conn_hash, NUM_WORKERS as u32) as usize
 }
 
-/// Simple connection-ID counter used to generate synthetic 4-tuple hashes.
-static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub fn next_conn_hash() -> u64 {
-    // In the kernel, reciprocal_scale operates on the precomputed 4-tuple
-    // hash.  We simulate this with a monotone counter mixed via a cheap
-    // multiplicative hash (Knuth's constant) to avoid modular bias patterns.
-    let n = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    n.wrapping_mul(0x9e3779b97f4a7c15)
+/// Epoll-exclusive baseline, modeled on the kernel's actual mechanism:
+///
+/// Each worker blocking in epoll_wait() adds a wait-queue entry for the
+/// listen socket, and `epoll_ctl(ADD)` inserts at the *head* of the queue
+/// (fs/eventpoll.c). An incoming connection wakes only the first idle entry
+/// found from the head (EPOLLEXCLUSIVE), i.e. the most recently blocked
+/// worker. Busy workers are not in the wait queue at all; if nobody is
+/// blocked, the connection sits in the shared accept queue until the next
+/// worker re-enters epoll_wait.
+///
+/// Simulation using generator-visible state:
+///   • "blocked in epoll_wait" ≈ empty accept queue and zero pending events;
+///   • "head of wait queue"   ≈ the most recent last_loop_entry timestamp
+///     (each loop iteration re-blocks the worker, re-inserting it at the head);
+///   • "all busy"             ≈ hand the connection to the worker with the
+///     shortest backlog — the closest analogue to "the next worker to come
+///     back to epoll_wait drains the shared accept queue".
+///
+/// Net effect matches the paper's description: new connections concentrate
+/// on the most-recently-active worker (LIFO bias), while a hung worker's
+/// growing backlog keeps it out of the idle set.
+fn dispatch_lifo(shared: &SharedState) -> usize {
+    let idle = (0..NUM_WORKERS)
+        .filter(|&i| {
+            shared.queues[i].is_empty()
+                && shared.wst.slot(i).pending_events.load(Ordering::Relaxed) == 0
+        })
+        .max_by_key(|&i| shared.wst.slot(i).last_loop_entry.load(Ordering::Relaxed));
+    if let Some(worker) = idle {
+        return worker;
+    }
+    (0..NUM_WORKERS)
+        .min_by_key(|&i| {
+            let backlog = shared.queues[i].len() as i64;
+            // Tie-break toward the most recently active worker (LIFO bias).
+            (backlog, -shared.wst.slot(i).last_loop_entry.load(Ordering::Relaxed))
+        })
+        .unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::ScheduleResult;
-    use crate::wst::{WorkerSnapshot, NUM_WORKERS};
+    use crate::shm::{test_state, ConnDesc};
 
-    fn dummy_snapshots() -> [WorkerSnapshot; NUM_WORKERS] {
-        std::array::from_fn(|_| WorkerSnapshot {
-            last_loop_entry: 0,
-            pending_events: 0,
-            accumulated_conns: 0,
-        })
-    }
-
-    fn make_result(bitmap: u64) -> ScheduleResult {
-        ScheduleResult {
-            bitmap,
-            after_stage1: 0,
-            after_stage2: 0,
-            after_stage3: 0,
-            snapshots: dummy_snapshots(),
+    #[test]
+    fn test_reciprocal_scale_stays_in_range() {
+        for hash in [0u64, 1, 0xffff_ffff, 0x1234_5678_9abc_def0, u64::MAX] {
+            let scaled = reciprocal_scale(hash, NUM_WORKERS as u32);
+            assert!((scaled as usize) < NUM_WORKERS);
         }
     }
 
     #[test]
-    fn test_hermes_dispatch_single_candidate() {
-        let result = make_result(0b0100); // only worker 2
-        let worker = dispatch_hermes(result.bitmap, 12345);
-        assert_eq!(worker, 2);
+    fn test_find_nth_set_bit() {
+        // bitmap 0b1101 → set bits at positions 0, 2, 3.
+        assert_eq!(find_nth_set_bit(0b1101, 0), 0);
+        assert_eq!(find_nth_set_bit(0b1101, 1), 2);
+        assert_eq!(find_nth_set_bit(0b1101, 2), 3);
     }
 
     #[test]
-    fn test_hermes_dispatch_distributes_across_candidates() {
+    fn test_hermes_dispatch_stays_within_candidates() {
         // Workers 0 and 2 available (bitmap = 0101).
         let bitmap: u64 = 0b0101;
-        let workers: std::collections::HashSet<usize> = (0..100)
-            .map(|h| dispatch_hermes(bitmap, h))
+        let workers: std::collections::HashSet<usize> = (0..1000)
+            .map(|h| dispatch_hermes(bitmap, (h as u64).wrapping_mul(0x9e3779b97f4a7c15)))
             .collect();
         assert!(workers.contains(&0));
         assert!(workers.contains(&2));
@@ -111,25 +165,46 @@ mod tests {
     }
 
     #[test]
-    fn test_lifo_picks_highest_id() {
-        let bitmap: u64 = 0b1010; // workers 1 and 3
-        assert_eq!(dispatch_lifo(bitmap), 3);
-    }
-
-    #[test]
-    fn test_reuseport_hash_ignores_bitmap() {
-        // Should distribute across all NUM_WORKERS regardless of load.
-        let workers: std::collections::HashSet<usize> = (0..NUM_WORKERS * 10)
-            .map(|h| dispatch_reuseport_hash(h as u64))
+    fn test_hermes_single_candidate_falls_back_to_hash() {
+        // Paper §5.3.2: n ≤ 1 → default reuseport hashing, otherwise every
+        // connection between scheduler updates would hit the same worker.
+        let bitmap: u64 = 0b0100;
+        let workers: std::collections::HashSet<usize> = (0..1000)
+            .map(|h| dispatch_hermes(bitmap, (h as u64).wrapping_mul(0x9e3779b97f4a7c15)))
             .collect();
-        assert_eq!(workers.len(), NUM_WORKERS);
+        assert!(workers.len() > 1, "single-candidate bitmap must fall back to full hash");
     }
 
     #[test]
-    fn test_empty_bitmap_falls_back_to_reuseport() {
-        let result = make_result(0);
-        // Should not panic; falls back to reuseport hash.
-        let worker = dispatch(&result, 42, Policy::Hermes);
+    fn test_empty_bitmap_falls_back_to_hash() {
+        let worker = dispatch_hermes(0, 42);
         assert!(worker < NUM_WORKERS);
+    }
+
+    #[test]
+    fn test_lifo_prefers_most_recently_blocked_idle_worker() {
+        let state = test_state();
+        // All workers idle; worker 1 blocked most recently (highest timestamp).
+        for (i, ts) in [(0usize, 100i64), (1, 400), (2, 300), (3, 200)] {
+            state.wst.slot(i).last_loop_entry.store(ts, Ordering::Relaxed);
+        }
+        assert_eq!(dispatch_lifo(&state), 1);
+        // Worker 1 becomes busy (pending events) → next idle head is worker 2.
+        state.wst.slot(1).pending_events.store(3, Ordering::Relaxed);
+        assert_eq!(dispatch_lifo(&state), 2);
+    }
+
+    #[test]
+    fn test_lifo_all_busy_picks_shortest_backlog() {
+        let state = test_state();
+        let desc = ConnDesc { conn_id: 0, hash: 0, arrival_ns: 0, service_us: 0, lifetime_ms: 0 };
+        // Every worker has a non-empty queue (nobody blocked in epoll_wait).
+        for i in 0..NUM_WORKERS {
+            for _ in 0..(i + 2) {
+                state.queues[i].push(desc);
+            }
+        }
+        // Worker 0 has the shortest backlog (2 entries).
+        assert_eq!(dispatch_lifo(&state), 0);
     }
 }

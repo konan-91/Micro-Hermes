@@ -1,118 +1,256 @@
-/// Metrics pipeline — structured CSV output for offline analysis and plotting.
-///
-/// Each tick one MetricsRow is recorded.  At program exit the full table is
-/// written to metrics.csv (appending policy: each run overwrites).
-///
-/// Columns mirror the quantities the Hermes paper measures (Fig. 13, Table 5):
-///   timestamp_ns  — monotonic clock at scheduling time
-///   worker_id     — which worker ran the scheduler this tick
-///   iter          — iteration number within that worker's loop
-///   bitmap        — hex scheduling result
-///   after_stage1/2/3 — survivors after each cascading filter
-///   w{0..N}_conns — per-worker connection count
-///   w{0..N}_events — per-worker pending events
-///   conn_sd       — standard deviation of connection counts (Fig. 13 metric)
-///   events_sd     — standard deviation of pending events
-///   dispatched_to — worker ID the dispatcher selected this tick (-1 = none)
-///   policy        — "hermes" | "lifo" | "reuseport"
+//! Metrics pipeline — structured CSV output for offline analysis/plotting.
+//!
+//! Two row types, two output files:
+//!
+//!   ticks CSV (METRICS_PATH, default metrics.csv) — one row per worker
+//!   event-loop iteration: WST snapshot, queue depth, and (Hermes only) the
+//!   Algorithm-1 stage survivors + bitmap. Drives balance-over-time plots
+//!   (conn/event standard deviation, the paper's Fig. 13 metric).
+//!
+//!   conns CSV (CONNS_PATH, default conns.csv) — one row per completed
+//!   connection: arrival → dequeue → done timestamps. latency_us
+//!   (done - arrival, i.e. queue wait + service) drives the P99-latency
+//!   comparisons (paper Table 5 / §10).
+//!
+//! Collection plumbing: each worker buffers rows locally and writes private
+//! headerless shard files when its loop ends; the parent merges shards after
+//! waitpid. Deliberately *not* shared memory — a Vec's heap buffer isn't in
+//! the MAP_SHARED region after fork(), and std Mutexes are UB across
+//! processes on macOS (os_unfair_lock EINVAL panics). Mirrors the WST's
+//! "each worker writes only its own column" partitioning, but with files.
 
-use crate::scheduler::{Policy, ScheduleResult};
-use crate::wst::NUM_WORKERS;
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
-use std::sync::Mutex;
+use crate::dispatcher::Policy;
+use crate::scheduler::ScheduleResult;
+use crate::wst::{WorkerSnapshot, NUM_WORKERS};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
-/// One row in the metrics CSV.
+/// One row per worker event-loop iteration.
 #[derive(Debug, Clone)]
-pub struct MetricsRow {
+pub struct TickRow {
     pub timestamp_ns: i64,
     pub worker_id: usize,
     pub iter: u32,
-    pub result: ScheduleResult,
-    pub dispatched_to: Option<usize>,
+    pub snapshots: [WorkerSnapshot; NUM_WORKERS],
+    pub queue_len: usize,
+    /// Algorithm-1 output — None for the baselines (no userspace scheduler).
+    pub result: Option<ScheduleResult>,
     pub policy: Policy,
 }
 
-/// Thread-safe accumulator — workers append rows; main flushes at the end.
-pub struct MetricsAccumulator {
-    rows: Mutex<Vec<MetricsRow>>,
+/// One row per completed connection.
+#[derive(Debug, Clone)]
+pub struct ConnRow {
+    pub conn_id: u64,
+    pub worker_id: usize,
+    pub arrival_ns: i64,
+    pub dequeue_ns: i64,
+    pub done_ns: i64,
+    pub service_us: u32,
+    pub policy: Policy,
 }
 
-impl MetricsAccumulator {
+/// Per-worker row buffers, flushed to shard files when the worker exits.
+pub struct MetricsShards {
+    pub ticks: Vec<TickRow>,
+    pub conns: Vec<ConnRow>,
+}
+
+impl MetricsShards {
     pub fn new() -> Self {
-        MetricsAccumulator { rows: Mutex::new(Vec::new()) }
+        MetricsShards { ticks: Vec::new(), conns: Vec::new() }
     }
 
-    pub fn push(&self, row: MetricsRow) {
-        self.rows.lock().unwrap().push(row);
-    }
-
-    /// Write all accumulated rows to `path` as CSV, sorted by timestamp.
-    pub fn flush_csv(&self, path: &str) -> std::io::Result<()> {
-        let mut rows = self.rows.lock().unwrap();
-        rows.sort_by_key(|r| r.timestamp_ns);
-
-        let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
-        let mut w = BufWriter::new(file);
-
-        // Header
-        let mut header = "timestamp_ns,worker_id,iter,bitmap,after_stage1,after_stage2,after_stage3,policy,dispatched_to".to_string();
-        for i in 0..NUM_WORKERS {
-            header.push_str(&format!(",w{i}_conns,w{i}_events"));
-        }
-        header.push_str(",conn_sd,events_sd");
-        writeln!(w, "{header}")?;
-
-        // Rows
-        for row in rows.iter() {
-            let policy_str = match row.policy {
-                Policy::Hermes => "hermes",
-                Policy::Lifo => "lifo",
-                Policy::ReuseportHash => "reuseport",
-            };
-            let dispatched = match row.dispatched_to {
-                Some(id) => id.to_string(),
-                None => "-1".to_string(),
-            };
-
-            let mut line = format!(
-                "{},{},{},{:#010x},{},{},{},{},{}",
-                row.timestamp_ns,
-                row.worker_id,
-                row.iter,
-                row.result.bitmap,
-                row.result.after_stage1,
-                row.result.after_stage2,
-                row.result.after_stage3,
-                policy_str,
-                dispatched,
-            );
-
-            let conns: Vec<i64> = (0..NUM_WORKERS)
-                .map(|i| row.result.snapshots[i].accumulated_conns)
-                .collect();
-            let events: Vec<i64> = (0..NUM_WORKERS)
-                .map(|i| row.result.snapshots[i].pending_events)
-                .collect();
-
-            for i in 0..NUM_WORKERS {
-                line.push_str(&format!(",{},{}", conns[i], events[i]));
-            }
-
-            let conn_sd = std_dev(&conns);
-            let events_sd = std_dev(&events);
-            line.push_str(&format!(",{conn_sd:.3},{events_sd:.3}"));
-
-            writeln!(w, "{line}")?;
-        }
-
-        w.flush()?;
-        eprintln!("[metrics] wrote {} rows to {path}", rows.len());
-        Ok(())
+    pub fn write(&self, tick_path: &Path, conn_path: &Path) -> std::io::Result<()> {
+        write_lines(tick_path, self.ticks.iter().map(format_tick_row))?;
+        write_lines(conn_path, self.conns.iter().map(format_conn_row))
     }
 }
 
-fn std_dev(values: &[i64]) -> f64 {
+fn write_lines(path: &Path, lines: impl Iterator<Item = String>) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    let mut w = BufWriter::new(file);
+    for line in lines {
+        writeln!(w, "{line}")?;
+    }
+    w.flush()
+}
+
+pub fn tick_header() -> String {
+    let mut header =
+        "timestamp_ns,worker_id,iter,bitmap_hex,bitmap_bin,after_stage1,after_stage2,after_stage3,queue_len,policy"
+            .to_string();
+    for i in 0..NUM_WORKERS {
+        header.push_str(&format!(",w{i}_conns,w{i}_events"));
+    }
+    header.push_str(",conn_sd,events_sd");
+    header
+}
+
+pub fn conn_header() -> String {
+    "conn_id,worker_id,arrival_ns,dequeue_ns,done_ns,queue_wait_us,service_us,latency_us,policy"
+        .to_string()
+}
+
+fn format_tick_row(row: &TickRow) -> String {
+    // Baselines have no Algorithm-1 output; write zeros so the schema is
+    // uniform across policies (simplifies pandas-side comparison).
+    let (bitmap, s1, s2, s3) = match &row.result {
+        Some(r) => (r.bitmap, r.after_stage1, r.after_stage2, r.after_stage3),
+        None => (0, 0, 0, 0),
+    };
+
+    let mut line = format!(
+        "{},{},{},{:#06x},{:0width$b},{},{},{},{},{}",
+        row.timestamp_ns,
+        row.worker_id,
+        row.iter,
+        bitmap,
+        bitmap,
+        s1,
+        s2,
+        s3,
+        row.queue_len,
+        row.policy.as_str(),
+        width = NUM_WORKERS,
+    );
+
+    let conns: Vec<i64> = row.snapshots.iter().map(|s| s.accumulated_conns).collect();
+    let events: Vec<i64> = row.snapshots.iter().map(|s| s.pending_events).collect();
+    for i in 0..NUM_WORKERS {
+        line.push_str(&format!(",{},{}", conns[i], events[i]));
+    }
+    line.push_str(&format!(",{:.3},{:.3}", std_dev(&conns), std_dev(&events)));
+    line
+}
+
+fn format_conn_row(row: &ConnRow) -> String {
+    let queue_wait_us = (row.dequeue_ns - row.arrival_ns) / 1_000;
+    let latency_us = (row.done_ns - row.arrival_ns) / 1_000;
+    format!(
+        "{},{},{},{},{},{},{},{},{}",
+        row.conn_id,
+        row.worker_id,
+        row.arrival_ns,
+        row.dequeue_ns,
+        row.done_ns,
+        queue_wait_us,
+        row.service_us,
+        latency_us,
+        row.policy.as_str(),
+    )
+}
+
+impl TickRow {
+    /// One console line per iteration (enabled with VERBOSE=1).
+    pub fn print(&self) {
+        let fmt_metric = |f: fn(&WorkerSnapshot) -> i64| {
+            self.snapshots.iter().map(|s| format!("{:>3}", f(s))).collect::<Vec<_>>().join(" ")
+        };
+        let sched = match &self.result {
+            Some(r) => format!(
+                "stages {}/{}/{} bitmap={:0width$b}",
+                r.after_stage1, r.after_stage2, r.after_stage3, r.bitmap,
+                width = NUM_WORKERS
+            ),
+            None => "(no scheduler)".to_string(),
+        };
+        println!(
+            "[w{}][{}] iter {:>4} | conns=[{}] events=[{}] qlen={:>3} | {}",
+            self.worker_id,
+            self.policy.as_str(),
+            self.iter,
+            fmt_metric(|s| s.accumulated_conns),
+            fmt_metric(|s| s.pending_events),
+            self.queue_len,
+            sched,
+        );
+    }
+}
+
+/// Merge headerless shard files into `out_path` with `header`, sorted
+/// numerically by the first column (timestamp for ticks, conn_id for conns).
+/// Returns the merged data lines for further summarization.
+pub fn merge_shards(
+    shard_paths: &[PathBuf],
+    out_path: &str,
+    header: &str,
+) -> std::io::Result<Vec<String>> {
+    let mut lines: Vec<(i64, String)> = Vec::new();
+    for path in shard_paths {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue, // worker may have produced zero rows
+        };
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let key: i64 = line.split(',').next().unwrap_or("0").parse().unwrap_or(0);
+            lines.push((key, line));
+        }
+    }
+    lines.sort_by_key(|(key, _)| *key);
+
+    let file = OpenOptions::new().write(true).create(true).truncate(true).open(out_path)?;
+    let mut w = BufWriter::new(file);
+    writeln!(w, "{header}")?;
+    for (_, line) in &lines {
+        writeln!(w, "{line}")?;
+    }
+    w.flush()?;
+    Ok(lines.into_iter().map(|(_, l)| l).collect())
+}
+
+/// Latency stats computed from merged conn-CSV lines (see conn_header).
+#[derive(Debug, Default)]
+pub struct ConnSummary {
+    pub completed: usize,
+    pub completed_per_worker: [usize; NUM_WORKERS],
+    pub mean_us: f64,
+    pub p50_us: i64,
+    pub p99_us: i64,
+    pub max_us: i64,
+}
+
+pub fn summarize_conns(lines: &[String]) -> ConnSummary {
+    let mut summary = ConnSummary::default();
+    let mut latencies: Vec<i64> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let fields: Vec<&str> = line.split(',').collect();
+        // Columns: see conn_header — worker_id is 1, latency_us is 7.
+        let (Some(worker), Some(latency)) = (
+            fields.get(1).and_then(|f| f.parse::<usize>().ok()),
+            fields.get(7).and_then(|f| f.parse::<i64>().ok()),
+        ) else {
+            continue;
+        };
+        if worker < NUM_WORKERS {
+            summary.completed_per_worker[worker] += 1;
+        }
+        latencies.push(latency);
+    }
+    if latencies.is_empty() {
+        return summary;
+    }
+    latencies.sort_unstable();
+    summary.completed = latencies.len();
+    summary.mean_us = latencies.iter().sum::<i64>() as f64 / latencies.len() as f64;
+    summary.p50_us = percentile(&latencies, 0.50);
+    summary.p99_us = percentile(&latencies, 0.99);
+    summary.max_us = *latencies.last().unwrap();
+    summary
+}
+
+/// Nearest-rank percentile over a sorted slice.
+fn percentile(sorted: &[i64], p: f64) -> i64 {
+    let rank = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+pub fn std_dev(values: &[i64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -120,42 +258,4 @@ fn std_dev(values: &[i64]) -> f64 {
     let mean = values.iter().sum::<i64>() as f64 / n;
     let variance = values.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
     variance.sqrt()
-}
-
-/// Pretty-print a scheduling result to stdout (used by workers each iter).
-pub fn print_tick(
-    worker_id: usize,
-    iter: u32,
-    result: &ScheduleResult,
-    dispatched_to: Option<usize>,
-    policy: Policy,
-) {
-    let policy_tag = match policy {
-        Policy::Hermes => "hermes",
-        Policy::Lifo => "lifo ",
-        Policy::ReuseportHash => "rport",
-    };
-    let dispatch_str = match dispatched_to {
-        Some(id) => format!("→ w{id}"),
-        None => "→ --".to_string(),
-    };
-    println!(
-        "[w{worker_id}][{policy_tag}] iter {iter:>3} | \
-         conns=[{}] events=[{}] | \
-         stages: {}/{}/{} | \
-         bitmap={:0width$b} {dispatch_str}",
-        (0..crate::wst::NUM_WORKERS)
-            .map(|i| format!("{:>2}", result.snapshots[i].accumulated_conns))
-            .collect::<Vec<_>>()
-            .join(" "),
-        (0..crate::wst::NUM_WORKERS)
-            .map(|i| format!("{:>2}", result.snapshots[i].pending_events))
-            .collect::<Vec<_>>()
-            .join(" "),
-        result.after_stage1,
-        result.after_stage2,
-        result.after_stage3,
-        result.bitmap,
-        width = crate::wst::NUM_WORKERS,
-    );
 }

@@ -1,138 +1,164 @@
-/// Workload generator — configurable synthetic connection arrivals.
-///
-/// Replaces the hardcoded "worker 0 is always slow" approach with a proper
-/// workload model covering the four Hermes paper cases (Table 3):
-///
-///   Case 1 — High CPS, Low processing time   (stress/spike scenario)
-///   Case 2 — High CPS, High processing time  (compression-heavy)
-///   Case 3 — Low CPS,  Low processing time   (finance/chat, long-lived conns)
-///   Case 4 — Low CPS,  High processing time  (SSL/regex-heavy web services)
-///
-/// Also supports hang injection so Stage 1 of Algorithm 1 is exercised.
+//! Workload definitions — the four traffic profiles from the paper (§10).
+//!
+//! A workload is described from the *traffic* side, matching how the paper
+//! characterizes its cases: connections per second (CPS) and per-connection
+//! processing cost at the LB. Processing cost is a property of the
+//! connection (SSL, compression, payload size), not of the worker — the
+//! generator samples it per connection and carries it in the ConnDesc.
+//!
+//!   Case 1 — High CPS, low processing time   (stress/spike scenario)
+//!   Case 2 — High CPS, high processing time  (compression-heavy; overload)
+//!   Case 3 — Low CPS,  low processing time   (long-lived conns: finance/chat)
+//!   Case 4 — Low CPS,  high processing time  (SSL/regex-heavy web services)
+//!
+//! Case 2 also injects a worker hang so Stage 1 of Algorithm 1 is exercised.
+//!
+//! Phase 2: this module is replaced by a real traffic generator (e.g. wrk)
+//! hitting real sockets — nothing here needs porting.
 
 use std::time::Duration;
 
-/// Processing time distribution for a workload case.
+/// Per-connection processing time distribution.
 #[derive(Debug, Clone, Copy)]
 pub enum ProcessingTime {
-    /// Fixed duration (simple testing).
+    /// Fixed duration (uniform cheap requests).
     Fixed(Duration),
-    /// Bimodal: most events fast, occasional slow events (simulates varied L7).
+    /// Bimodal: most connections fast, some slow — models the paper's highly
+    /// variable per-connection L7 cost (SSL handshakes, compression).
     Bimodal {
-        fast_ms: u64,
-        slow_ms: u64,
-        /// Probability [0,1] of a slow event.
+        fast: Duration,
+        slow: Duration,
+        /// Probability [0,1] of drawing the slow cost.
         slow_probability: f64,
     },
 }
 
 impl ProcessingTime {
-    /// Draw a processing time sample.  Uses a simple LCG so no rand crate needed.
+    /// Draw a sample. Deterministic in `seed` (no rand crate needed).
     pub fn sample(&self, seed: u64) -> Duration {
         match self {
             ProcessingTime::Fixed(d) => *d,
-            ProcessingTime::Bimodal { fast_ms, slow_ms, slow_probability } => {
-                // Simple LCG random float in [0, 1).
-                let r = lcg_float(seed);
-                if r < *slow_probability {
-                    Duration::from_millis(*slow_ms)
-                } else {
-                    Duration::from_millis(*fast_ms)
-                }
+            ProcessingTime::Bimodal { fast, slow, slow_probability } => {
+                if lcg_float(seed) < *slow_probability { *slow } else { *fast }
             }
         }
     }
 }
 
-/// One of the four paper workload scenarios.
+/// One of the four paper scenarios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadCase {
-    Case1, // High CPS, Low processing time
-    Case2, // High CPS, High processing time
-    Case3, // Low CPS,  Low processing time  (most common — 56% of production)
-    Case4, // Low CPS,  High processing time
+    Case1,
+    Case2,
+    Case3, // most common in production (~56%)
+    Case4,
 }
 
-/// Per-worker workload configuration.
-#[derive(Debug, Clone)]
+/// A hang injected into one worker, to exercise Stage-1 hang detection.
+#[derive(Debug, Clone, Copy)]
+pub struct HangSpec {
+    pub worker_id: usize,
+    /// When the hang starts, relative to worker start.
+    pub at: Duration,
+    /// How long the worker stays stuck (must exceed HANG_THRESHOLD_NS to
+    /// actually trip the time filter).
+    pub duration: Duration,
+}
+
+/// Full traffic profile for one run.
+#[derive(Debug, Clone, Copy)]
 pub struct WorkloadConfig {
-    /// How many event-loop iterations to run.
-    pub iterations: u32,
-    /// Processing time per event for this worker.
-    pub processing_time: ProcessingTime,
-    /// If Some(iter), the worker simulates a hang starting at that iteration
-    /// by sleeping longer than HANG_THRESHOLD_NS.  This exercises Stage 1.
-    pub hang_at_iter: Option<u32>,
-    /// Duration of the injected hang (should exceed HANG_THRESHOLD_NS = 200ms).
-    pub hang_duration: Duration,
-    /// Events returned per simulated epoll_wait call.
-    pub events_per_batch: i64,
+    /// New connections per second.
+    pub cps: u32,
+    /// How long the generator produces traffic.
+    pub duration: Duration,
+    /// Per-connection processing cost distribution.
+    pub service: ProcessingTime,
+    /// How long each connection stays open after its request is processed
+    /// (drives `conn -= 1`; large values model long-lived connections).
+    pub lifetime: Duration,
+    /// Optional injected hang.
+    pub hang: Option<HangSpec>,
 }
 
 impl WorkloadConfig {
-    /// Build a configuration for one of the four paper cases.
-    pub fn for_case(case: WorkloadCase, worker_id: usize) -> Self {
+    /// Traffic profiles sized so each run finishes in a few seconds on a
+    /// laptop while keeping the paper's qualitative CPS/cost relationships
+    /// (capacity here is NUM_WORKERS ≈ 4 worker-seconds of processing per
+    /// wall-clock second).
+    pub fn for_case(case: WorkloadCase) -> Self {
         match case {
+            // High CPS, cheap requests: ~10% utilization, dispatch-rate bound.
             WorkloadCase::Case1 => WorkloadConfig {
-                iterations: 40,
-                processing_time: ProcessingTime::Fixed(Duration::from_millis(2)),
-                hang_at_iter: None,
-                hang_duration: Duration::ZERO,
-                events_per_batch: 2 + (worker_id as i64 % 3),
+                cps: 400,
+                duration: Duration::from_secs(3),
+                service: ProcessingTime::Fixed(Duration::from_millis(1)),
+                lifetime: Duration::from_millis(150),
+                hang: None,
             },
+            // High CPS *and* expensive requests: offered load ≈ 4.5
+            // worker-sec/sec vs capacity 4 → sustained overload, queues grow.
+            // Worker 0 hangs partway through to exercise Stage 1.
             WorkloadCase::Case2 => WorkloadConfig {
-                iterations: 20,
-                processing_time: ProcessingTime::Bimodal {
-                    fast_ms: 10,
-                    slow_ms: 200,
-                    slow_probability: 0.2,
+                cps: 100,
+                duration: Duration::from_secs(4),
+                service: ProcessingTime::Bimodal {
+                    fast: Duration::from_millis(10),
+                    slow: Duration::from_millis(150),
+                    slow_probability: 0.25,
                 },
-                // Worker 0 hangs partway through — exercises Stage 1.
-                hang_at_iter: if worker_id == 0 { Some(5) } else { None },
-                hang_duration: Duration::from_millis(350),
-                events_per_batch: 3,
+                lifetime: Duration::from_millis(200),
+                hang: Some(HangSpec {
+                    worker_id: 0,
+                    at: Duration::from_millis(1500),
+                    duration: Duration::from_millis(400),
+                }),
             },
+            // Low CPS, cheap, long-lived: connections never close within the
+            // run — final open-connection balance is the headline metric.
             WorkloadCase::Case3 => WorkloadConfig {
-                iterations: 30,
-                processing_time: ProcessingTime::Fixed(Duration::from_millis(3)),
-                hang_at_iter: None,
-                hang_duration: Duration::ZERO,
-                events_per_batch: 2,
+                cps: 60,
+                duration: Duration::from_secs(4),
+                service: ProcessingTime::Fixed(Duration::from_millis(2)),
+                lifetime: Duration::from_secs(60),
+                hang: None,
             },
+            // Low CPS, expensive: ~75% utilization, occasional very slow
+            // connections pin workers for long stretches.
             WorkloadCase::Case4 => WorkloadConfig {
-                iterations: 15,
-                processing_time: ProcessingTime::Bimodal {
-                    fast_ms: 20,
-                    slow_ms: 150,
-                    slow_probability: 0.4,
+                cps: 40,
+                duration: Duration::from_secs(4),
+                service: ProcessingTime::Bimodal {
+                    fast: Duration::from_millis(20),
+                    slow: Duration::from_millis(200),
+                    slow_probability: 0.3,
                 },
-                hang_at_iter: None,
-                hang_duration: Duration::ZERO,
-                events_per_batch: 1 + (worker_id as i64 % 2),
+                lifetime: Duration::from_millis(400),
+                hang: None,
             },
         }
     }
 
-    /// Default config used when no case is specified — matches the original
-    /// behaviour (worker 0 slow, others fast) for backward compatibility.
-    pub fn default_for_worker(worker_id: usize) -> Self {
+    /// Quick mixed profile for manual smoke testing (not paper validation).
+    pub fn default_case() -> Self {
         WorkloadConfig {
-            iterations: 25,
-            processing_time: if worker_id == 0 {
-                ProcessingTime::Fixed(Duration::from_millis(40))
-            } else {
-                ProcessingTime::Fixed(Duration::from_millis(2))
+            cps: 150,
+            duration: Duration::from_millis(2500),
+            service: ProcessingTime::Bimodal {
+                fast: Duration::from_millis(2),
+                slow: Duration::from_millis(40),
+                slow_probability: 0.1,
             },
-            hang_at_iter: None,
-            hang_duration: Duration::ZERO,
-            events_per_batch: 2 + (worker_id as i64 % 3),
+            lifetime: Duration::from_millis(250),
+            hang: None,
         }
     }
 }
 
-/// Simple LCG pseudo-random float in [0, 1).
+/// SplitMix64-style scramble → float in [0, 1). Good enough for simulation.
 fn lcg_float(seed: u64) -> f64 {
-    // Park-Miller-esque constants, good enough for simulation.
-    let x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (x >> 11) as f64 / (1u64 << 53) as f64
 }

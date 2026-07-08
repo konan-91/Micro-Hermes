@@ -1,12 +1,12 @@
-/// Worker Status Table (§4.1, Fig. 10).
-///
-/// Flat array of 64-byte WorkerSlot structs, each holding the three Hermes
-/// metrics (loop timestamp, pending events, connection count) as AtomicI64.
-/// Mapped into shared anonymous memory via mmap before forking so that every
-/// worker process reads and writes the same physical pages without locks.
-///
-/// Note: this table is purely for userspace scheduling.  The eBPF maps
-/// (MSel, Msocket) that synchronise results to the kernel come in Phase 2.
+//! Worker Status Table (§4.1, Fig. 10).
+//!
+//! Flat array of 64-byte WorkerSlot structs, each holding the three Hermes
+//! metrics (loop timestamp, pending events, connection count) as AtomicI64.
+//! Mapped into shared anonymous memory via mmap before forking so that every
+//! worker process reads and writes the same physical pages without locks.
+//!
+//! Note: this table is purely for userspace scheduling.  The eBPF maps
+//! (MSel, Msocket) that synchronise results to the kernel come in Phase 2.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -97,5 +97,10 @@ impl Wst {
 pub fn now_monotonic_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+    // Casts kept deliberately: tv_sec/tv_nsec widths differ across targets
+    // (this code runs on macOS now and Linux in Phase 2).
+    #[allow(clippy::unnecessary_cast)]
+    {
+        ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+    }
 }

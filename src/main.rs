@@ -41,6 +41,7 @@ fn main() {
     let metrics_path = std::env::var("METRICS_PATH").unwrap_or_else(|_| "metrics.csv".to_string());
     let conns_path = std::env::var("CONNS_PATH").unwrap_or_else(|_| "conns.csv".to_string());
     let verbose = std::env::var("VERBOSE").map(|v| v == "1").unwrap_or(false);
+    let seed: u64 = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let policy = match policy_str.as_str() {
         "lifo" => Policy::Lifo,
@@ -57,7 +58,7 @@ fn main() {
     };
 
     eprintln!(
-        "[main] policy={} case={case_str} cps={} duration={:?} → {metrics_path}, {conns_path}",
+        "[main] policy={} case={case_str} cps={} duration={:?} seed={seed} → {metrics_path}, {conns_path}",
         policy.as_str(),
         config.cps,
         config.duration,
@@ -98,7 +99,7 @@ fn main() {
     }
 
     // ── Parent: generate traffic (kernel stand-in), then reap children ─────
-    let gen_stats = generator::run(shared, &config, policy);
+    let gen_stats = generator::run(shared, &config, policy, seed);
     for pid in &child_pids {
         let mut status = 0i32;
         unsafe { libc::waitpid(*pid, &mut status, 0) };

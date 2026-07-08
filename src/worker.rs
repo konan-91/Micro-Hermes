@@ -35,16 +35,17 @@ use std::time::{Duration, Instant};
 /// traffic. This timer is part of Hermes's instrumentation, not baseline
 /// behavior.
 const HERMES_EPOLL_TIMEOUT: Duration = Duration::from_millis(5);
-/// Baseline workers have no scheduler to keep live, so they block until
-/// work arrives, waking only on a coarse housekeeping timer (vanilla event
-/// loops use timer wakeups on the order of their timeout wheel, not 5 ms).
-/// This matters for LIFO fidelity: a blocked worker keeps its wait-queue
-/// position (last_loop_entry stays put), so the most-recently-active worker
-/// stays at the head and concentrates load, exactly the epoll-exclusive
-/// pathology the paper describes. A short timer on idle baseline workers
-/// would re-insert everyone at the head on every expiry and scramble that
-/// order. Must stay well above the inter-arrival gap of the low-CPS cases.
-const BASELINE_EPOLL_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Baseline workers have no scheduler to keep live, so they model vanilla
+/// epoll_wait(-1): block until work arrives (the poll also wakes on
+/// shutdown, so this effectively never expires within a run). This matters
+/// for LIFO fidelity: a blocked worker keeps its wait-queue position
+/// (last_loop_entry stays put), so the most-recently-active worker stays at
+/// the head and concentrates load persistently — the epoll-exclusive
+/// pathology the paper describes. Any periodic idle timer here re-inserts
+/// workers at the head on each expiry; because forked workers start in
+/// phase, that rotates the concentration target in lock-step and
+/// artificially evens out per-worker totals (observed with a 1 s timer).
+const BASELINE_EPOLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max events returned per simulated epoll_wait call (MAX_EVENTS in Fig. 9).
 /// Small relative to real epoll loops because our simulated per-event cost
 /// is ms-scale sleeps (real L7 events are µs-scale): a large batch would

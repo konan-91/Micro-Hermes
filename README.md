@@ -76,6 +76,7 @@ All configuration is via environment variables:
 | `METRICS_PATH` | file path | `metrics.csv` | Per-iteration tick CSV |
 | `CONNS_PATH` | file path | `conns.csv` | Per-connection latency CSV |
 | `VERBOSE` | `1` | off | Print every worker loop iteration |
+| `SEED` | integer | `0` | Perturbs the synthetic connection-hash stream (for distinct benchmark trials) |
 
 ### Policies
 
@@ -91,9 +92,10 @@ All configuration is via environment variables:
   therefore picks the most-recently-blocked idle worker (empty queue, no
   pending events, newest loop timestamp); when nobody is idle it hands the
   connection to the shortest backlog, approximating the shared accept queue.
-  Baseline workers block with a coarse 1 s housekeeping timer rather than
-  Hermes's 5 ms scheduler timer, so the wait-queue order stays stable — this
-  is what produces the real mechanism's concentration pathology.
+  Baseline workers block until work arrives (like `epoll_wait(-1)`) rather
+  than on Hermes's 5 ms scheduler timer, so the wait-queue order stays
+  stable — this is what produces the real mechanism's concentration
+  pathology.
 - **`reuseport`** — `SO_REUSEPORT`'s stateless hash: `reciprocal_scale`
   of the 4-tuple hash across all workers, no awareness of worker state.
 
@@ -113,16 +115,11 @@ property of the connection — SSL, compression — not the worker):
 
 ### Reproducing the comparison matrix
 
-```bash
-mkdir -p results
-for policy in hermes lifo reuseport; do
-  for case in 1 2 3 4; do
-    METRICS_PATH="results/${policy}_case${case}_ticks.csv" \
-    CONNS_PATH="results/${policy}_case${case}_conns.csv" \
-    POLICY=$policy WORKLOAD_CASE=$case cargo run --quiet
-  done
-done
-```
+Everything for benchmarking and graphing lives in [analysis/](analysis/):
+`analysis/run_benchmarks.sh` runs the full policy × case × trial matrix, and
+`analysis/hermes_analysis.ipynb` is an annotated notebook that generates all
+dissertation figures (PNG + PDF) and tables (CSV + LaTeX) in one *Run All* —
+see [analysis/README.md](analysis/README.md).
 
 ### Expected qualitative results (validation targets, CLAUDE.md §10)
 
@@ -193,9 +190,11 @@ directly into pandas/matplotlib.
 - **Simulation compensations** (documented in code): `MAX_EVENTS` is small
   (4) because simulated per-event costs are ms-scale sleeps, not the real
   µs-scale — large batches would stretch iterations past the 200 ms hang
-  threshold and starve the scheduler of fresh data; baseline workers use a
-  1 s idle timer instead of Hermes's 5 ms one so the LIFO wait-queue order
-  isn't artificially scrambled.
+  threshold and starve the scheduler of fresh data; baseline workers block
+  until work arrives (modelling `epoll_wait(-1)`) instead of using Hermes's
+  5 ms timer, because any periodic idle wakeup re-inserts phase-locked
+  forked workers at the wait-queue head in lock-step, rotating the LIFO
+  concentration target and artificially evening out per-worker totals.
 
 ## Testing
 

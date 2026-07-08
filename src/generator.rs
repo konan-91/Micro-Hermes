@@ -33,7 +33,11 @@ pub struct GenStats {
 
 /// Generate `cfg.cps` connections/sec for `cfg.duration`, dispatching each
 /// via `policy`, then signal shutdown. Blocks until traffic is done.
-pub fn run(shared: &SharedState, cfg: &WorkloadConfig, policy: Policy) -> GenStats {
+///
+/// `seed` perturbs the synthetic 4-tuple hash sequence so repeated benchmark
+/// trials draw different (but reproducible) service-time assignments rather
+/// than replaying the identical connection stream.
+pub fn run(shared: &SharedState, cfg: &WorkloadConfig, policy: Policy, seed: u64) -> GenStats {
     let interval = std::time::Duration::from_secs_f64(1.0 / cfg.cps as f64);
     let start = Instant::now();
     let mut next_arrival = start;
@@ -51,9 +55,11 @@ pub fn run(shared: &SharedState, cfg: &WorkloadConfig, policy: Policy) -> GenSta
         }
 
         let conn_id = stats.generated;
-        // Synthetic 4-tuple hash: a counter scrambled by Knuth's
-        // multiplicative constant, standing in for the kernel's skb hash.
-        let hash = conn_id.wrapping_mul(0x9e3779b97f4a7c15);
+        // Synthetic 4-tuple hash: a counter (xor'd with the scrambled trial
+        // seed) mixed by Knuth's multiplicative constant, standing in for
+        // the kernel's skb hash. seed = 0 reproduces the canonical stream.
+        let hash = (conn_id ^ seed.wrapping_mul(0xff51afd7ed558ccd))
+            .wrapping_mul(0x9e3779b97f4a7c15);
         let service = cfg.service.sample(hash);
 
         let target = dispatch(shared, policy, hash);

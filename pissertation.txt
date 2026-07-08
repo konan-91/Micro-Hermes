@@ -1,0 +1,283 @@
+Micro-Hermes: An Open-Source Implementation of eBPF Load Balancing
+
+CS5099 Dissertation, Plan and Context Survey
+
+Student: 250014506
+
+Table of Contents
+
+Introduction
+
+1.1 Motivation
+
+1.2 Problem Statement
+
+1.3 Aims and Objectives
+
+1.4 Report Structure
+
+Background
+
+2.1 Linux Connection Scheduling Mechanisms
+
+2.2 The Layer 4 vs Layer 7 Distinction
+
+2.3 eBPF and Kernel Programmability
+
+2.4 The Hermes Architecture
+
+Related Work
+
+3.1 Traditional CPU and Network Scheduling
+
+3.2 Layer 4 eBPF Load Balancing
+
+3.3 Layer 7 and Application-Aware Load Balancing
+
+3.4 Positioning Micro-Hermes
+
+Design
+
+4.1 System Architecture Overview
+
+4.2 Worker Status Table
+
+4.3 eBPF Kernel Dispatcher
+
+4.4 Userspace Scheduler
+
+4.5 Alternative Scheduling Algorithms
+
+Implementation
+
+5.1 Rust Toolchain and eBPF Integration
+
+5.2 Shared Memory Communication
+
+5.3 SO_ATTACH_REUSEPORT_EBPF Hook
+
+5.4 Engineering Challenges
+
+Evaluation
+
+6.1 Evaluation Framework and Methodology
+
+6.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
+
+6.3 CPU Overhead and Latency Analysis
+
+6.4 Worker Hang Prevention Results
+
+6.5 Discussion
+
+Conclusion
+
+7.1 Summary of Contributions
+
+7.2 Limitations
+
+7.3 Future Work
+
+2. Related Work
+
+2.1 Traditional CPU and Network Scheduling
+
+The problem of distributing work across CPU cores has a long history in
+operating systems research. Classical CPU schedulers, such as the
+Completely Fair Scheduler (CFS) in Linux, aim to divide processing time
+equitably among threads based on runtime metrics (Molnar, 2007). These
+schedulers operate at the process level and are well-studied; however,
+they are not designed to account for the nature of individual network
+connections or the imbalance that can arise when some requests are
+significantly heavier than others.
+
+Network scheduling has similarly been studied in the context of packet
+queuing and traffic shaping, with disciplines like weighted fair queuing
+(WFQ) designed to prevent any one flow from monopolising bandwidth
+(Demers et al., 1989). While these approaches are foundational, they
+operate at the traffic level rather than the application level and do
+not address the worker-level fairness problem that arises inside a
+single server process.
+
+While historical OS scheduling shares the core goal of distributing
+uneven workloads fairly, it operates in a completely different
+environment. Older research provides a helpful conceptual framework, but
+it does not offer a direct technical solution for routing tasks inside a
+single server application.
+
+2.2 Linux Connection Scheduling Mechanisms
+
+Modern Linux provides two primary mechanisms for distributing incoming
+connections across multiple workers: epoll_exclusive and SO_REUSEPORT.
+
+epoll_exclusive, introduced in Linux 4.5, allows multiple threads to
+wait on the same epoll file descriptor such that only one thread is
+woken per event, avoiding thundering herd issues (Linux man-pages,
+2023a). However, it offers no insight into worker busyness. The kernel
+selects a worker without knowing whether it is already processing a
+heavy or long-lived request.
+
+SO_REUSEPORT allows multiple sockets to bind to the same port, with the
+kernel distributing incoming connections across them using a hash of the
+source address and port (Linux man-pages, 2023b). This is statistically
+fair across many connections but is equally blind to application-level
+worker state. A worker that happens to receive several slow or expensive
+connections will become overloaded while others sit idle.
+
+Both mechanisms are widely used in high-performance servers (nginx,
+envoy, etc.) precisely because of their simplicity and low overhead. The
+limitation they share, blindness to userspace worker status, is the
+central problem Micro-Hermes addresses.
+
+2.3 eBPF and Kernel Programmability
+
+eBPF (extended Berkeley Packet Filter) allows user-defined programs to
+be safely injected into the Linux kernel at designated hook points,
+verified by a kernel-side verifier before execution (eBPF.io, 2024).
+Originally designed for packet filtering, eBPF has expanded into a
+general-purpose kernel extension mechanism used for tracing, security
+enforcement, and networking.
+
+In the networking context, eBPF programs can be attached at various
+layers of the kernel stack. The XDP (eXpress Data Path) hook sits at the
+network driver layer, allowing programs to process raw packets before
+they enter the kernel networking stack which makes it suitable for
+ultra-low-latency packet forwarding. The SO_ATTACH_REUSEPORT_EBPF socket
+option, by contrast, hooks into the socket selection layer and allows an
+eBPF program to override the kernel's default reuseport hashing logic,
+deciding which socket receives each new connection. This is the hook
+used by Hermes, and by Micro-Hermes.
+
+The eBPF verifier ensures that injected programs cannot crash the kernel
+or loop infinitely, making this a safe mechanism for extending kernel
+behaviour without kernel module development. Toolchains such as Aya (a
+Rust-native eBPF library) allow eBPF programs to be written and loaded
+from Rust, which is the approach taken in this project.
+
+2.4 Layer 4 eBPF Load Balancing
+
+A significant body of recent work applies eBPF at Layer 4 (the transport
+layer) for load balancing across clusters of servers. These systems are
+designed for high-throughput packet forwarding in data centre
+environments.
+
+Meta's Katran is a widely deployed example: it uses eBPF and XDP to
+perform consistent-hash-based load balancing across backend servers at
+line rate, handling tens of millions of packets per second per core
+(Manekar & Narayanan, 2018). Cilium similarly leverages eBPF to replace
+kube-proxy in Kubernetes environments, providing cluster-wide load
+balancing and network policy enforcement without the overhead of
+iptables (Cilium Authors, 2024).
+
+Recent academic work has continued in this direction. arkLB proposes an
+adaptive, rack-aware Layer 4 load balancer using eBPF and XDP, targeting
+data centre topologies to reduce cross-rack traffic (will get citation
+later!). HEELS and the CRAB load balancer represent further efforts to
+improve consistency and efficiency of packet-level forwarding using
+kernel bypass techniques (here also, lv4 balancers so do not need to
+explain in depth).
+
+These systems are all highly relevant as prior art, but they address a
+fundamentally different problem from Micro-Hermes. Because they operate
+at Layer 4, on raw packets before the kernel's networking stack
+processes them, they have no visibility into application-layer
+information such as HTTP headers, TLS session state, or per-worker
+processing loads. They cannot determine whether a particular worker
+process is idle or overwhelmed. Their goal is infrastructure-scale
+traffic distribution, not intra-server worker fairness.
+
+2.5 Layer 7 and Application-Aware Load Balancing
+
+Layer 7 load balancers operate at the application layer and can make
+routing decisions based on application-level information such as request
+type, headers, or session affinity. Software load balancers such as
+HAProxy and Nginx perform Layer 7 load balancing in userspace, typically
+acting as reverse proxies that accept all connections and forward them
+to backends (HAProxy Technologies, 2024). While flexible and
+feature-rich, these systems introduce additional latency from the proxy
+hop and are not designed for the intra-server, kernel-level dispatching
+problem.
+
+The paper most directly relevant to this project is Hermes (Pan et al.,
+2025), an industry system from Alibaba Cloud that tackles the worker
+overload problem at Layer 7 using an eBPF-based approach. Hermes
+introduces a Worker Status Table (WST) maintained in shared memory, into
+which application workers continuously write their real-time load
+metrics (pending events, accumulated connections, and timestamps). An
+eBPF hook at the SO_ATTACH_REUSEPORT_EBPF layer reads this table at
+connection arrival time and dispatches each new connection to the
+least-loaded available worker, preventing overload before it occurs. The
+results reported are striking and resulted in a 99.8% reduction in daily
+worker hangs and an 18.9% reduction in infrastructure unit cost in
+production at Alibaba Cloud.
+
+Hermes is closed-source, however, and operates at hyperscale within a
+proprietary infrastructure stack. Micro-Hermes aims to reproduce the
+core architecture in an open-source, single-node Rust implementation,
+validating the approach at smaller scale and making it accessible to
+organisations without Alibaba-scale infrastructure.
+
+XLB (Peking University, 2026) is a related recent system that removes
+the sidecar proxy from microservice communication by placing load
+balancing logic directly in eBPF at the kernel level. Rather than
+requiring service A to route via a sidecar proxy to reach service B, XLB
+intercepts inter-service messages in the kernel and consults an internal
+load map to determine which instance of B should receive the request.
+Like Hermes, XLB demonstrates that kernel-level, status-aware dispatch
+can outperform proxy-based approaches. Unlike Hermes (and Micro-Hermes),
+XLB targets inter-server microservice communication rather than
+intra-server worker dispatch, making it a complementary rather than
+directly competing approach.
+
+2.6 Positioning Micro-Hermes
+
+The related work above reveals a clear gap: while Layer 4 eBPF load
+balancing is mature and well-studied, application-aware intra-server
+dispatching (preventing individual worker processes from becoming
+overloaded while others sit idle) remains largely the domain of
+proprietary, closed-source industry systems like Hermes. Open-source,
+reproducible implementations that validate and democratise this approach
+are absent from the literature.
+
+Micro-Hermes addresses this gap by providing an open-source, single-node
+implementation of the Hermes architecture in Rust. It targets the same
+SO_ATTACH_REUSEPORT_EBPF hook, implements the Worker Status Table in
+shared memory, and benchmarks the resulting system against standard
+Linux mechanisms. In doing so it both validates the original paper's
+claims at smaller scale and provides a foundation that smaller
+organisations can build on.
+
+References
+
+-   eBPF.io. (2024). What is eBPF? https://ebpf.io/
+
+-   Cilium Authors. (2024). Cilium: eBPF-based networking, security, and
+    observability. https://cilium.io/
+
+-   Demers, A., Keshav, S., & Shenker, S. (1989). Analysis and
+    simulation of a fair queuing algorithm. ACM SIGCOMM Computer
+    Communication Review, 19(4), 1–12.
+
+-   HAProxy Technologies. (2024). HAProxy: The reliable, high
+    performance TCP/HTTP load balancer. https://www.haproxy.org/
+
+-   Linux man-pages. (2023a). epoll(7) — Linux Programmer's Manual.
+    https://man7.org/linux/man-pages/man7/epoll.7.html
+
+-   Linux man-pages. (2023b). SO_REUSEPORT socket option.
+    https://lwn.net/Articles/542629/
+
+-   Manekar, V., & Narayanan, A. (2018). Katran: A high performance
+    layer 4 load balancer. Meta Engineering Blog.
+    https://engineering.fb.com/2018/05/22/open-source/katran/
+
+-   Molnar, I. (2007). Modular scheduler core and completely fair
+    scheduler. Linux Kernel Mailing List.
+    https://lwn.net/Articles/230501/
+
+-   Pan, T., Song, E., Zuo, Y., Zhang, S., Song, Y., Zhao, J., Hou, W.,
+    Lu, J., Sun, X., Zhang, S., Yang, Y., Zhang, J., Huang, T., Lyu, B.,
+    Li, X., Wen, R., Zong, Z., & Zhu, S. (2025). Hermes: Enhancing
+    Layer-7 Cloud Load Balancers with Userspace-Directed I/O Event
+    Notification. Proceedings of EuroSys 2025, 363–380.
+    https://doi.org/10.1145/3718958.3750469

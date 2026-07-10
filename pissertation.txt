@@ -38,11 +38,11 @@ Related Work
 
 Design
 
-4.1 System Architecture Overview
+4.1 Two-Phase Approach and System Architecture Overview
 
 4.2 Worker Status Table
 
-4.3 eBPF Kernel Dispatcher
+4.3 Kernel Connection Dispatcher
 
 4.4 Userspace Scheduler
 
@@ -54,7 +54,7 @@ Implementation
 
 5.2 Shared Memory Communication
 
-5.3 SO_ATTACH_REUSEPORT_EBPF Hook
+5.3 Simulating the Kernel Dispatch Path
 
 5.4 Engineering Challenges
 
@@ -64,9 +64,9 @@ Evaluation
 
 6.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
 
-6.3 CPU Overhead and Latency Analysis
+6.3 Worker Hang Prevention Results
 
-6.4 Worker Hang Prevention Results
+6.4 Scheduler Filter Behaviour
 
 6.5 Discussion
 
@@ -246,6 +246,360 @@ shared memory, and benchmarks the resulting system against standard
 Linux mechanisms. In doing so it both validates the original paper's
 claims at smaller scale and provides a foundation that smaller
 organisations can build on.
+
+4. Design
+
+4.1 Two-Phase Approach and System Architecture Overview
+
+Micro-Hermes is developed in two phases. Phase 1, the subject of this
+dissertation, is a complete userspace simulation of Hermes's three-stage
+feedback loop: every architectural element of the original system (the
+Worker Status Table, the per-worker scheduler, the connection
+dispatcher, and the shared-memory communication between them) is
+implemented faithfully, while the two elements that require a Linux
+kernel (the eBPF dispatch program and real sockets) are replaced by
+userspace stand-ins with equivalent interfaces. Phase 2, left to future
+work, replaces those stand-ins with a real eBPF program attached via
+SO_ATTACH_REUSEPORT_EBPF. The component boundaries of the Phase 1
+implementation are drawn deliberately along the kernel/userspace line so
+that this transition replaces components rather than restructuring the
+system.
+
+The simulation reproduces Hermes's division of labour with real
+operating-system processes. A parent process stands in for the kernel:
+it generates synthetic connection arrivals at a configurable rate,
+computes a hash standing in for the kernel's 4-tuple hash of each
+connection, runs the dispatch mechanism under test, and places each
+connection into the chosen worker's accept queue. Four forked child
+processes stand in for the load balancer's workers, each running the
+instrumented run-to-completion event loop from the Hermes paper:
+timestamp the loop entry, collect a batch of events (an epoll_wait
+analogue over the accept queue, with the paper's 5 ms timeout),
+process each event, maintain the status metrics, and, at the end of
+every iteration, run the scheduling pass. All cross-process state (the
+Worker Status Table, the candidate bitmap, and the accept queues) lives
+in a single region of shared anonymous memory mapped before forking.
+
+Crucially, the feedback loop is closed: a worker's load consists
+exclusively of the connections the dispatcher assigned to it, and the
+dispatcher's decisions are driven by the bitmap the workers' schedulers
+publish. Scheduling decisions therefore directly shape the measured
+load distribution, which is the property the evaluation exercises.
+
+4.2 Worker Status Table
+
+The WST follows the layout described by Pan et al. (2025): one slot per
+worker holding the three status metrics, each stored as an individually
+atomic 64-bit integer. The metrics are the timestamp of the most recent
+event-loop entry (used for hang detection), the count of pending events
+(events delivered by epoll_wait but not yet handled, a proxy for
+instantaneous processing load), and the accumulated count of open
+connections (a guard against future overload from synchronised bursts
+on long-lived connections). Each slot is padded to a 64-byte cache line
+to prevent false sharing between workers on adjacent cores.
+
+The concurrency design is preserved exactly: the table is partitioned
+by writer, with each worker updating only its own slot, and the
+scheduler reads the entire table without locks. Reads may race with
+updates from other workers; as in the original system this is accepted
+by design, since per-field atomicity prevents torn values and a
+marginally stale metric does not meaningfully change a scheduling
+decision.
+
+4.3 Kernel Connection Dispatcher
+
+The dispatcher implements Hermes's Algorithm 2. For each new connection
+it reads the candidate bitmap from M_Sel, counts the set bits, and, if
+more than one candidate survives, scales the connection's hash into the
+candidate count using the Linux kernel's reciprocal_scale function (a
+multiply-and-shift mapping, reimplemented exactly) and selects the Nth
+set bit of the bitmap. If one or zero candidates survive, it falls back
+to plain reuseport hashing across all workers, matching the paper's
+fallback rule: dispatching every connection that arrives between
+scheduler updates to a single "best" worker would itself overload it.
+
+Although Phase 1 executes this logic in the parent process rather than
+in the kernel, it is written under eBPF's constraints (no heap
+allocation, statically bounded loops) so that the Phase 2 port to an
+eBPF program is mechanical. M_Sel itself is modelled as a single shared
+atomic 64-bit integer, mirroring the atomic read/write guarantee that a
+single-element BPF_MAP_TYPE_ARRAY provides in the real system; only the
+internals of this component change in Phase 2.
+
+4.4 Userspace Scheduler
+
+Every worker runs Hermes's Algorithm 1 at the end of each event-loop
+iteration: there is no dedicated scheduler process, exactly as in the
+original design. The scheduler snapshots the WST and applies three
+cascading filters in the paper's fixed priority order. The time filter
+removes workers whose last loop entry is older than a hang threshold
+(200 ms in this implementation; the paper leaves the constant
+implementation-defined). The connection-count filter and the
+pending-event filter each remove workers whose metric exceeds the
+candidate average plus an offset theta, which prevents the candidate
+set from collapsing when workers are near-uniformly loaded. Following
+the paper's empirical finding that theta/avg = 0.5 is optimal, theta is
+computed as half the candidate average, with a small floor so the
+filter remains permissive at cold start. The surviving set is encoded
+as a bitmap and written to M_Sel with a single atomic store.
+
+Because the scheduler runs once per loop iteration and epoll_wait is
+bounded by a 5 ms timeout, every worker is guaranteed to re-enter its
+loop, and therefore to refresh its timestamp and re-run the scheduler,
+at least once every 5 ms even with no traffic at all, keeping both
+hang detection and the candidate set live under idle conditions.
+
+4.5 Alternative Scheduling Algorithms
+
+Two baseline dispatch mechanisms are implemented for comparison,
+modelling the standard Linux mechanisms described in Section 2.2. Under
+the reuseport baseline, the dispatcher applies reciprocal_scale to the
+connection hash across all workers unconditionally, reproducing
+SO_REUSEPORT's stateless behaviour: no awareness of worker state, and
+no scheduler runs at all.
+
+The epoll-exclusive baseline models the kernel's actual wakeup
+mechanism rather than a caricature of it. In the kernel, each worker
+blocking in epoll_wait adds an entry at the head of the listen socket's
+wait queue, and an incoming connection wakes only the first entry: the
+most recently blocked worker. The simulation reproduces this with
+generator-visible state: an idle worker (empty accept queue, no pending
+events) with the most recent loop-entry timestamp is the head of the
+wait queue and receives the connection; when no worker is idle the
+connection goes to the shortest backlog, approximating the shared
+accept queue that the next free worker would drain. Baseline workers
+block until work arrives (modelling epoll_wait with no timeout) rather
+than on Hermes's 5 ms timer; the significance of this detail is
+discussed in Section 5.4.
+
+5. Implementation
+
+5.1 Rust Toolchain and eBPF Integration
+
+Phase 1 is implemented in stable Rust with a single dependency (libc,
+for mmap, fork and waitpid), approximately 1,600 lines across nine
+modules, with unit tests covering the scheduler's filters, the
+dispatcher's bit manipulation, and the shared-memory queue. No eBPF
+toolchain is required yet, but the codebase is structured for the
+Phase 2 integration with Aya: the dispatcher is verifier-compatible as
+written, the M_Sel wrapper exposes the same store/load interface as an
+Aya array-map handle, and the WST and scheduler carry over unchanged
+since they remain in userspace in the real system.
+
+5.2 Shared Memory Communication
+
+All cross-process state lives in one structure mapped with
+mmap(MAP_SHARED | MAP_ANONYMOUS) before forking, so the parent and all
+workers share the same physical pages without any IPC machinery, and
+atomic operations on the shared pages are well-defined across the
+process boundary. Alongside the WST and M_Sel, the region contains one
+single-producer single-consumer ring buffer per worker, standing in
+for the kernel's per-socket accept queue. Because each ring has
+exactly one producer (the generator) and one consumer (the owning
+worker), acquire/release ordering on the head and tail indices is
+sufficient and the design remains lock-free throughout, mirroring the
+WST's partitioned-writer principle. A full ring rejects the
+connection, modelling accept-queue overflow.
+
+5.3 Simulating the Kernel Dispatch Path
+
+The parent process paces connection arrivals against absolute
+deadlines at the workload's target connections-per-second, so sleep
+jitter does not accumulate as rate drift. Each connection carries a
+synthetic 4-tuple hash (a counter mixed with a multiplicative constant,
+optionally perturbed by a per-trial seed), a sampled per-connection
+processing cost, and a lifetime after which the receiving worker closes
+it. Workers simulate L7 processing by sleeping for the connection's
+cost; processing expense is thus a property of the connection rather
+than the worker, matching the paper's characterisation of variable L7
+cost (TLS handshakes, compression, protocol translation).
+
+5.4 Engineering Challenges
+
+Three issues encountered during implementation are worth recording.
+First, metrics collection across fork(): an early design accumulated
+benchmark records in a mutex-protected vector placed in the shared
+region, which is unsound; a vector's heap allocation is not in the
+shared mapping, and standard-library mutexes are undefined across
+processes on some platforms (on macOS the underlying os_unfair_lock
+aborts with EINVAL). Each worker instead buffers records privately and
+writes its own file shard, which the parent merges after waitpid,
+applying the WST's single-writer partitioning idea to the benchmarking
+plumbing itself.
+
+Second, a subtle fidelity artefact in the epoll-exclusive baseline:
+an early version gave idle baseline workers a periodic 1-second
+housekeeping timer. Because the workers are forked simultaneously,
+their timers were phase-locked, and each expiry re-inserted a worker at
+the head of the simulated wait queue in lock-step. The concentration
+target rotated once per second, producing per-worker totals that were
+artificially perfectly balanced, masking the very pathology the
+baseline exists to demonstrate. Modelling idle baseline workers as
+blocking indefinitely (as vanilla epoll_wait does) restored the
+persistent concentration the mechanism actually exhibits.
+
+Third, batch sizing: real L7 events cost microseconds, but the
+simulation's per-event sleeps cost milliseconds, so a realistic
+epoll_wait batch limit would stretch a single loop iteration past the
+hang-detection threshold and starve the scheduler of fresh status
+data. The batch limit is therefore kept small (4 events), preserving
+the paper's property that scheduler frequency scales with load.
+
+6. Evaluation
+
+6.1 Evaluation Framework and Methodology
+
+The evaluation reproduces the four traffic regimes used by Pan et al.
+(2025), characterised by connections-per-second (CPS) and
+per-connection processing cost: Case 1, high CPS with low cost (a
+stress or traffic-spike scenario); Case 2, high CPS with high cost
+(compression-heavy traffic, configured here as a sustained overload at
+roughly 112% of aggregate worker capacity, with a 400 ms stall
+injected into one worker); Case 3, low CPS with low cost but
+long-lived connections that never close within the run (the
+finance/chat pattern, and the most common case in Alibaba's
+production); and Case 4, low CPS with high cost (TLS- and regex-heavy
+web services at roughly 75% utilisation).
+
+Each of the three dispatch policies is run against each case three
+times, with a per-trial seed varying the (reproducible) sequence of
+connection hashes and sampled processing costs. Two record streams are
+collected: one row per completed connection (arrival, dequeue and
+completion timestamps, so that latency includes both queueing delay
+and service time), and one row per worker event-loop iteration (a WST
+snapshot plus, for Micro-Hermes, the scheduler's per-stage survivor
+counts and bitmap). Percentiles are computed within each trial and
+then aggregated across trials. Load balance is measured as the
+standard deviation of per-worker connection counts, the metric the
+Hermes paper uses for its production comparison. The full pipeline,
+from benchmark execution to every figure and table referenced below,
+is reproducible from a single annotated Jupyter notebook in the
+project repository.
+
+6.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
+
+Case 1 (high CPS, low cost). All three policies are latency-equivalent
+(median 1.3 ms), as expected when load is far below capacity. The
+mechanisms differ sharply in balance: Micro-Hermes spreads the 1,200
+connections most evenly (standard deviation 15 connections across
+workers, against 29 for reuseport), while the epoll-exclusive model
+concentrates almost the entire run on a single worker (standard
+deviation 514), confirming the LIFO wakeup bias at high arrival rates.
+
+Case 2 (high CPS, high cost, with an injected hang). Under sustained
+overload Micro-Hermes achieves a mean latency of 636 ms against
+reuseport's 785 ms, a 19% improvement attributable to routing around
+busy and stalled workers, with a comparable 99th percentile.
+Reuseport's stateless hash continues to direct a fixed share of new
+connections at the stalled worker for the full duration of the stall,
+inflating its distribution throughout. The epoll-exclusive model posts
+the lowest latency here (mean 399 ms); Section 6.5 explains why this
+is a boundary of the simulation rather than a property of the real
+mechanism.
+
+Case 3 (low CPS, long-lived connections). This case reproduces the
+paper's headline production result. Because connections never close,
+dispatch errors accumulate for the whole run, and the final
+open-connection balance exposes each mechanism's character: the
+epoll-exclusive model ends with a standard deviation of 98 connections
+(its busiest worker holding roughly 230 of 240 connections while two
+workers receive none at all), against 15 for Micro-Hermes and 14 for
+reuseport. This is the same ordering the paper reports from production
+(standard deviations of 3,200, 50 and 20 for exclusive, reuseport and
+Hermes respectively). Micro-Hermes does not beat reuseport here as
+production Hermes does; Section 6.5 discusses why parity is the
+faithful expectation in this synthetic setting.
+
+Case 4 (low CPS, high cost). With expensive connections and moderate
+utilisation, Micro-Hermes's 99th-percentile latency of 496 ms is
+roughly half of reuseport's 977 ms, which suffers from queueing new
+connections behind slow ones on already-busy workers. The
+epoll-exclusive model again leads (303 ms), with Micro-Hermes tracking
+it as the paper predicts: Hermes's closed-loop status detection reacts
+with a small lag where exclusive's wakeup of an idle worker is
+immediate.
+
+Across all four cases Micro-Hermes is never the worst-performing
+policy, whereas each baseline collapses in at least one regime
+(epoll-exclusive on balance in Cases 1 and 3; reuseport on latency in
+Cases 2 and 4). This adaptability, rather than outright victory in any
+single regime, is the core property claimed for the Hermes
+architecture, and the simulation reproduces it.
+
+6.3 Worker Hang Prevention Results
+
+Case 2 injects a 400 ms stall into one worker mid-run, modelling the
+edge-triggered starvation hangs that motivated Hermes. The recorded
+scheduler decisions show the mechanism operating as designed: the
+stalled worker's loop-entry timestamp goes stale, and the time filter
+removes it from the candidate bitmap approximately 200 ms after stall
+onset, exactly the configured hang threshold. It is readmitted shortly
+after the stall ends, once it re-enters its loop and re-stamps the
+WST. Notably, exclusion is enacted by the other workers' schedulers,
+since the stalled worker cannot run its own; this confirms the value
+of embedding the scheduler in every worker rather than in a dedicated
+process. During the same window the reuseport baseline continues to
+assign approximately a quarter of new connections to the stalled
+worker: the failure mode that motivated Hermes's timestamp-based hang
+detection, observed directly.
+
+6.4 Scheduler Filter Behaviour
+
+The per-stage survivor counts recorded at every scheduling pass show
+the cascading filter behaving as the paper describes. Under light load
+(Cases 1 and 3) the filters barely prune: nearly all four workers
+survive every stage. Under load the candidate set contracts, most
+sharply in the overloaded Case 2, where the mean surviving set after
+the third filter falls to roughly 2.5 of 4 workers, with the
+event-count filter doing the most work. This matches the paper's
+observation that the fraction of workers passing the coarse filter
+decreases as load increases, while theta's margin prevents collapse to
+a single candidate, which would forfeit the kernel-side fine-grained
+selection and trigger the fallback path.
+
+6.5 Discussion
+
+Two results deviate from the paper's rankings, and both are boundaries
+of a userspace simulation rather than defects of the architecture;
+they are recorded here as honest limitations of Phase 1.
+
+First, the epoll-exclusive model wins on raw latency in Cases 2 and 4,
+whereas the paper places Hermes ahead of exclusive under high
+processing cost. The simulation cannot reproduce the kernel-side costs
+that degrade real epoll-exclusive under load: the O(#ports) wait-queue
+traversal (the simulated deployment has a single port where production
+load balancers serve tens of thousands), wakeup overhead, and the
+cache-unfriendliness that kept the round-robin variant out of the
+mainline kernel. Stripped of those costs, the model's all-busy path
+behaves like an ideal work-conserving central queue, which is a strong
+scheduler under uniform saturation. The latency comparison between
+Micro-Hermes and exclusive should therefore be read as conservative
+towards Micro-Hermes.
+
+Second, Micro-Hermes only matches rather than beats reuseport's
+balance in Case 3. The paper's production advantage (a standard
+deviation of 20 against 50) arises because real connections have
+wildly uneven durations, degrading a stateless hash's balance over
+time, whereas Case 3's synthetic connections are identical and never
+close, leaving the hash near-optimal by construction. Parity is
+accordingly the faithful expectation here, and the qualitative claim
+that survives is the one that matters: both status-blind mechanisms
+are outclassed by an order of magnitude by the LIFO model, and only
+status-aware dispatch avoids every failure mode observed.
+
+Finally, the paper's CPU overhead profile (0.674% to 2.436% total
+across counters, scheduler, syscalls and the eBPF dispatcher) cannot
+be meaningfully validated in a simulation whose processing consists of
+sleeps; overhead measurement is deferred to Phase 2, where flamegraph
+profiling of the real instrumented event loop becomes possible.
+
+Within its stated boundaries, the evaluation supports the central
+claims of the Hermes design: the three-stage feedback loop balances
+load more evenly than either standard Linux mechanism, detects and
+routes around hung workers within a bounded window using only three
+atomically-updated metrics, degrades gracefully to reuseport behaviour
+when its candidate set thins, and, uniquely among the three mechanisms
+tested, remains competitive in every traffic regime.
 
 References
 

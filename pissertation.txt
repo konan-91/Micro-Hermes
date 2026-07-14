@@ -626,19 +626,51 @@ they are recorded here as honest limitations of Phase 1.
 
 First, the epoll-exclusive model wins on raw latency in Cases 2 and 4,
 whereas the paper places Hermes ahead of exclusive under high
-processing cost. The simulation cannot reproduce the kernel-side costs
-that degrade real epoll-exclusive under load: the O(#ports) wait-queue
-traversal (the simulated deployment has a single port where production
-load balancers serve tens of thousands), wakeup overhead, and the
-cache-unfriendliness that kept the round-robin variant out of the
-mainline kernel. Stripped of those costs, the model's all-busy path
-behaves like an ideal work-conserving central queue, which is a strong
-scheduler under uniform saturation. The latency comparison between
-Micro-Hermes and exclusive should therefore be read as conservative
-towards Micro-Hermes. Case 5 supplies the measured counterweight
-within the simulation itself: the same concentration that lets the
-exclusive model post low dispatch latency costs it a three-to-four-fold
-latency penalty the moment its accumulated connections become active.
+processing cost. This is the simulation's sharpest limitation, and it
+follows from an architectural difference between the real mechanisms
+that the Phase-1 harness does not fully honour. Real SO_REUSEPORT — and
+therefore both reuseport and Micro-Hermes, which build on it — gives
+every worker its own listening socket with its own kernel accept queue,
+each worker draining only its own; the simulation reproduces this
+faithfully with one queue per worker. Real epoll-exclusive is different
+in kind: all workers share a single socket and a single accept queue,
+and the kernel's only decision is which idle worker to wake to drain
+it. Because there are no per-worker queues in that design, there is no
+per-worker backlog for it to inspect. The simulated baseline, however,
+reuses the per-worker-queue infrastructure that the other two policies
+genuinely require, and its fallback path — taken once every worker is
+busy, as under Case 2's overload — hands each connection to whichever
+of the four queues is currently shortest. That is a
+join-the-shortest-queue placement: an actively load-aware decision, and
+the reason the simulated LIFO posts strong latency and even balance
+together in Case 2. The real mechanism could not make that decision at
+all, being blind to per-worker backlog by construction. Our baseline is
+therefore better-informed than the system it stands in for, and its
+Case 2 and 4 latency cannot be read as a property of real
+epoll-exclusive.
+
+Two further factors compound the effect, both in the same direction.
+Micro-Hermes is mildly handicapped against the simulated baseline: its
+candidate bitmap is refreshed only once per worker loop iteration (a
+faithful property of the real design, whose scheduler runs at the end
+of each loop) and is therefore slightly stale against the
+per-connection-fresh queue depths the baseline reads. And real
+epoll-exclusive carries kernel-side costs the simulation omits outright
+— the O(#ports) wait-queue traversal (the simulated deployment has a
+single port where production load balancers serve tens of thousands),
+the wakeup overhead, and the cache-unfriendliness that kept the
+round-robin wakeup variant out of the mainline kernel. The latency
+comparison between Micro-Hermes and exclusive should therefore be read
+as conservative towards Micro-Hermes throughout. Reproducing real
+epoll-exclusive faithfully would require building a separate
+single-shared-queue path for the baseline alone; that effort is better
+directed at Phase 2, whose real kernel dispatch answers the question
+without approximation, than at a second queue structure thrown away
+when the simulated kernel is. Case 5, meanwhile, supplies the measured
+counterweight within the simulation itself: the very concentration that
+lets the exclusive model post low dispatch latency costs it a
+three-to-four-fold latency penalty the moment its hoarded connections
+become active.
 
 Second, Micro-Hermes only matches rather than beats reuseport's
 balance in Case 3. The paper's production advantage (a standard

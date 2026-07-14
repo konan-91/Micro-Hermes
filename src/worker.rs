@@ -23,29 +23,21 @@ use crate::dispatcher::Policy;
 use crate::metrics::{ConnRow, MetricsShards, TickRow};
 use crate::scheduler::{schedule, HANG_THRESHOLD_NS};
 use crate::shm::{ConnDesc, ConnQueue, SharedState};
-use crate::workload::HangSpec;
+use crate::workload::{BurstSpec, HangSpec};
 use crate::wst::now_monotonic_ns;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Hermes epoll_wait timeout (§4.2): guarantees the loop — and thus hang
-/// detection and the scheduler — runs at least every 5 ms even with zero
-/// traffic. This timer is part of Hermes's instrumentation, not baseline
-/// behavior.
-const HERMES_EPOLL_TIMEOUT: Duration = Duration::from_millis(5);
-/// Baseline workers have no scheduler to keep live, so they model vanilla
-/// epoll_wait(-1): block until work arrives (the poll also wakes on
-/// shutdown, so this effectively never expires within a run). This matters
-/// for LIFO fidelity: a blocked worker keeps its wait-queue position
-/// (last_loop_entry stays put), so the most-recently-active worker stays at
-/// the head and concentrates load persistently — the epoll-exclusive
-/// pathology the paper describes. Any periodic idle timer here re-inserts
-/// workers at the head on each expiry; because forked workers start in
-/// phase, that rotates the concentration target in lock-step and
-/// artificially evens out per-worker totals (observed with a 1 s timer).
-const BASELINE_EPOLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// epoll_wait timeout, applied under every policy: the paper's LB runs a
+/// 5 ms timer in all epoll modes (Fig. 5b measured it under epoll
+/// exclusive). Under Hermes it additionally guarantees the loop — and thus
+/// hang detection and the scheduler — runs at least every 5 ms even with
+/// zero traffic (§5.3.2). Safe for the LIFO baseline because its wait-queue
+/// priority is static (epoll_ctl registration order), so idle wakeups don't
+/// reshuffle it.
+const EPOLL_TIMEOUT: Duration = Duration::from_millis(5);
 /// Max events returned per simulated epoll_wait call (MAX_EVENTS in Fig. 9).
 /// Small relative to real epoll loops because our simulated per-event cost
 /// is ms-scale sleeps (real L7 events are µs-scale): a large batch would
@@ -60,6 +52,7 @@ pub fn worker_loop(
     shared: &'static SharedState,
     worker_id: usize,
     hang: Option<HangSpec>,
+    burst: Option<BurstSpec>,
     policy: Policy,
     tick_shard: &Path,
     conn_shard: &Path,
@@ -69,9 +62,14 @@ pub fn worker_loop(
     let queue = &shared.queues[worker_id];
     let start = Instant::now();
     let mut shards = MetricsShards::new();
-    // Close deadlines (monotonic ns) of connections this worker holds open.
-    let mut open_conns: Vec<i64> = Vec::new();
+    // (conn_id, close deadline in monotonic ns) of connections held open.
+    let mut open_conns: Vec<(u64, i64)> = Vec::new();
     let mut hang_pending = hang.filter(|h| h.worker_id == worker_id);
+    // Synchronized burst (Case 5): once `burst.at` passes, every connection
+    // this worker holds open generates one ready follow-up event.
+    let mut burst_pending = burst;
+    let mut burst_backlog: Vec<u64> = Vec::new();
+    let mut burst_trigger_ns: i64 = 0;
     let mut iter: u32 = 0;
 
     loop {
@@ -96,7 +94,7 @@ pub fn worker_loop(
 
         // ── Fig. 9 line 37: close connections whose lifetime expired ─────
         let now = now_monotonic_ns();
-        open_conns.retain(|&deadline| {
+        open_conns.retain(|&(_, deadline)| {
             if deadline <= now {
                 slot.accumulated_conns.fetch_sub(1, Ordering::Relaxed);
                 false
@@ -105,42 +103,83 @@ pub fn worker_loop(
             }
         });
 
+        // ── Burst trigger (Case 5): every open connection fires one
+        // follow-up event, all at once. Connection affinity means only this
+        // worker can process them — they queue as its ready-event backlog.
+        if let Some(b) = burst_pending {
+            if start.elapsed() >= b.at {
+                burst_backlog = open_conns.iter().map(|&(id, _)| id).collect();
+                burst_trigger_ns = now_monotonic_ns();
+                eprintln!(
+                    "[w{worker_id}] burst: {} follow-up events at t={:?}",
+                    burst_backlog.len(),
+                    start.elapsed()
+                );
+                burst_pending = None;
+            }
+        }
+
         // ── Fig. 9 line 13: epoll_wait(timer = 5ms) ──────────────────────
-        let timeout = if policy == Policy::Hermes {
-            HERMES_EPOLL_TIMEOUT
+        // Burst follow-ups are already-ready events, so while any remain
+        // epoll_wait would return immediately with them; the accept queue
+        // waits its turn, exactly like a saturated run-to-completion worker.
+        if !burst_backlog.is_empty() {
+            let n = burst_backlog.len().min(MAX_EVENTS);
+            let ids: Vec<u64> = burst_backlog.drain(..n).collect();
+            // Fig. 9 line 14: shm_busy_count(+event_num).
+            slot.pending_events.fetch_add(ids.len() as i64, Ordering::Relaxed);
+            for conn_id in ids {
+                let dequeue_ns = now_monotonic_ns();
+                let service = burst.expect("backlog implies burst spec").service;
+                thread::sleep(service);
+                let done_ns = now_monotonic_ns();
+                // Fig. 9 line 18: shm_busy_count(-1). No conn count change —
+                // the connection already exists and stays open.
+                slot.pending_events.fetch_sub(1, Ordering::Relaxed);
+                shards.conns.push(ConnRow {
+                    conn_id,
+                    worker_id,
+                    arrival_ns: burst_trigger_ns,
+                    dequeue_ns,
+                    done_ns,
+                    service_us: service.as_micros() as u32,
+                    policy,
+                    kind: "burst",
+                });
+            }
         } else {
-            BASELINE_EPOLL_TIMEOUT
-        };
-        let batch = poll_accept_queue(shared, queue, timeout);
+            let batch = poll_accept_queue(shared, queue, EPOLL_TIMEOUT);
 
-        // ── Fig. 9 line 14: shm_busy_count(+event_num) ───────────────────
-        slot.pending_events.fetch_add(batch.len() as i64, Ordering::Relaxed);
+            // ── Fig. 9 line 14: shm_busy_count(+event_num) ───────────────
+            slot.pending_events.fetch_add(batch.len() as i64, Ordering::Relaxed);
 
-        // ── Fig. 9 lines 16-18: handle each event ────────────────────────
-        for desc in &batch {
-            // accept_handler: line 25, shm_conn_count(+1).
-            slot.accumulated_conns.fetch_add(1, Ordering::Relaxed);
-            let dequeue_ns = now_monotonic_ns();
+            // ── Fig. 9 lines 16-18: handle each event ────────────────────
+            for desc in &batch {
+                // accept_handler: line 25, shm_conn_count(+1).
+                slot.accumulated_conns.fetch_add(1, Ordering::Relaxed);
+                let dequeue_ns = now_monotonic_ns();
 
-            // The L7 work itself (SSL, compression, ...) — simulated.
-            thread::sleep(Duration::from_micros(desc.service_us as u64));
-            let done_ns = now_monotonic_ns();
+                // The L7 work itself (SSL, compression, ...) — simulated.
+                thread::sleep(Duration::from_micros(desc.service_us as u64));
+                let done_ns = now_monotonic_ns();
 
-            // Fig. 9 line 18: shm_busy_count(-1).
-            slot.pending_events.fetch_sub(1, Ordering::Relaxed);
+                // Fig. 9 line 18: shm_busy_count(-1).
+                slot.pending_events.fetch_sub(1, Ordering::Relaxed);
 
-            // Connection stays open for its lifetime, then closes (line 37).
-            open_conns.push(done_ns + desc.lifetime_ms as i64 * 1_000_000);
+                // Connection stays open for its lifetime, closes at line 37.
+                open_conns.push((desc.conn_id, done_ns + desc.lifetime_ms as i64 * 1_000_000));
 
-            shards.conns.push(ConnRow {
-                conn_id: desc.conn_id,
-                worker_id,
-                arrival_ns: desc.arrival_ns,
-                dequeue_ns,
-                done_ns,
-                service_us: desc.service_us,
-                policy,
-            });
+                shards.conns.push(ConnRow {
+                    conn_id: desc.conn_id,
+                    worker_id,
+                    arrival_ns: desc.arrival_ns,
+                    dequeue_ns,
+                    done_ns,
+                    service_us: desc.service_us,
+                    policy,
+                    kind: "accept",
+                });
+            }
         }
 
         // ── Fig. 9 line 20: schedule_and_sync(), END of loop ─────────────
@@ -167,7 +206,7 @@ pub fn worker_loop(
         }
         shards.ticks.push(tick);
 
-        if shared.shutdown_requested() && queue.is_empty() {
+        if shared.shutdown_requested() && queue.is_empty() && burst_backlog.is_empty() {
             break;
         }
         iter = iter.wrapping_add(1);
@@ -180,8 +219,8 @@ pub fn worker_loop(
 
 /// Simulated epoll_wait on the accept queue: returns as soon as at least one
 /// event is ready (draining up to MAX_EVENTS, like a real ready-list sweep),
-/// or an empty batch after `timeout`. Also wakes on shutdown so baseline
-/// workers with long timeouts exit promptly (harness plumbing, not Fig. 9).
+/// or an empty batch after `timeout`. Also wakes on shutdown so workers exit
+/// promptly (harness plumbing, not Fig. 9).
 fn poll_accept_queue(
     shared: &SharedState,
     queue: &ConnQueue,

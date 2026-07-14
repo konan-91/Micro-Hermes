@@ -39,7 +39,11 @@ pub struct TickRow {
     pub policy: Policy,
 }
 
-/// One row per completed connection.
+/// One row per completed event: the initial request of a new connection
+/// (kind = "accept") or a follow-up request on an established connection
+/// during a synchronized burst (kind = "burst", Case 5 only). For burst
+/// rows, arrival_ns is the moment the burst fired, so latency_us measures
+/// how long the follow-up waited behind its siblings on the owning worker.
 #[derive(Debug, Clone)]
 pub struct ConnRow {
     pub conn_id: u64,
@@ -49,6 +53,7 @@ pub struct ConnRow {
     pub done_ns: i64,
     pub service_us: u32,
     pub policy: Policy,
+    pub kind: &'static str,
 }
 
 /// Per-worker row buffers, flushed to shard files when the worker exits.
@@ -89,7 +94,7 @@ pub fn tick_header() -> String {
 }
 
 pub fn conn_header() -> String {
-    "conn_id,worker_id,arrival_ns,dequeue_ns,done_ns,queue_wait_us,service_us,latency_us,policy"
+    "conn_id,worker_id,arrival_ns,dequeue_ns,done_ns,queue_wait_us,service_us,latency_us,policy,kind"
         .to_string()
 }
 
@@ -129,7 +134,7 @@ fn format_conn_row(row: &ConnRow) -> String {
     let queue_wait_us = (row.dequeue_ns - row.arrival_ns) / 1_000;
     let latency_us = (row.done_ns - row.arrival_ns) / 1_000;
     format!(
-        "{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{}",
         row.conn_id,
         row.worker_id,
         row.arrival_ns,
@@ -139,6 +144,7 @@ fn format_conn_row(row: &ConnRow) -> String {
         row.service_us,
         latency_us,
         row.policy.as_str(),
+        row.kind,
     )
 }
 

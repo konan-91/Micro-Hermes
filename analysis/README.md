@@ -7,7 +7,7 @@ micro-hermes simulator.
 
 | Path | What it is |
 |---|---|
-| `run_benchmarks.sh` | Runs the full matrix: 3 policies × 4 cases × `TRIALS` trials (each trial gets a distinct `SEED`). Skips result files that already exist. |
+| `run_benchmarks.sh` | Runs the full matrix: 3 policies × 5 cases × `TRIALS` trials (each trial gets a distinct `SEED`). Skips result files that already exist. |
 | `hermes_analysis.ipynb` | **The one thing to run.** Annotated notebook: generates data if missing, then produces all figures and tables. Every figure section includes a suggested caption and a design-justification paragraph written for direct adaptation into the dissertation. |
 | `results/` | Raw per-run CSVs (`*_ticks.csv`, `*_conns.csv`). Git-ignored; regenerate any time. |
 | `figures/` | Output figures, PNG (300 dpi, drafts) + PDF (vector, for LaTeX). |
@@ -43,3 +43,4 @@ notebook will pick up whatever is present, but keep the two values in sync).
 | `fig4_concentration_profile` | Per-worker totals ranked busiest→least (Case 3) | Shape of imbalance (LIFO starvation) |
 | `fig5_hang_detection` | Stage-1 filter reacting to an injected stall | Mechanism demonstration |
 | `fig6_cascade_stages` | Survivors per Algorithm-1 stage per case | Filter behaviour vs. load |
+| `fig7_burst` | Follow-up latency CDF when all open connections fire at once (Case 5) | Measured cost of LIFO's connection concentration |

@@ -30,7 +30,7 @@ BIN="$REPO_ROOT/target/release/micro-hermes"
 total=0
 skipped=0
 for trial in $(seq 1 "$TRIALS"); do
-  for case in 1 2 3 4; do
+  for case in 1 2 3 4 5; do
     for policy in hermes lifo reuseport; do
       ticks="$RESULTS_DIR/${policy}_case${case}_trial${trial}_ticks.csv"
       conns="$RESULTS_DIR/${policy}_case${case}_trial${trial}_conns.csv"

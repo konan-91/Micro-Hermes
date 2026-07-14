@@ -10,6 +10,8 @@
 //!   Case 2 — High CPS, high processing time  (compression-heavy; overload)
 //!   Case 3 — Low CPS,  low processing time   (long-lived conns: finance/chat)
 //!   Case 4 — Low CPS,  high processing time  (SSL/regex-heavy web services)
+//!   Case 5 — Case 3 + synchronized burst on all open connections (beyond
+//!            the paper's four: evidence for the concentration failure mode)
 //!
 //! Case 2 also injects a worker hang so Stage 1 of Algorithm 1 is exercised.
 //!
@@ -45,13 +47,18 @@ impl ProcessingTime {
     }
 }
 
-/// One of the four paper scenarios.
+/// One of the four paper scenarios, plus the burst-evidence scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadCase {
     Case1,
     Case2,
     Case3, // most common in production (~56%)
     Case4,
+    /// Case 5 (beyond the paper's four): Case-3-style accumulation of
+    /// long-lived connections followed by a synchronized burst of follow-up
+    /// requests on every open connection — the failure mode the paper's
+    /// `conn` metric exists to guard against (§3).
+    Case5,
 }
 
 /// A hang injected into one worker, to exercise Stage-1 hang detection.
@@ -63,6 +70,18 @@ pub struct HangSpec {
     /// How long the worker stays stuck (must exceed HANG_THRESHOLD_NS to
     /// actually trip the time filter).
     pub duration: Duration,
+}
+
+/// A synchronized burst of follow-up requests: at time `at`, every open
+/// connection generates one ready event on the worker that owns it.
+/// Connection affinity means those events cannot migrate — whoever holds
+/// the connections must serialize the whole backlog through its own loop.
+#[derive(Debug, Clone, Copy)]
+pub struct BurstSpec {
+    /// When the burst fires, relative to worker start.
+    pub at: Duration,
+    /// Processing cost of each follow-up request.
+    pub service: Duration,
 }
 
 /// Full traffic profile for one run.
@@ -79,6 +98,8 @@ pub struct WorkloadConfig {
     pub lifetime: Duration,
     /// Optional injected hang.
     pub hang: Option<HangSpec>,
+    /// Optional synchronized burst on open connections.
+    pub burst: Option<BurstSpec>,
 }
 
 impl WorkloadConfig {
@@ -95,6 +116,7 @@ impl WorkloadConfig {
                 service: ProcessingTime::Fixed(Duration::from_millis(1)),
                 lifetime: Duration::from_millis(150),
                 hang: None,
+                burst: None,
             },
             // High CPS *and* expensive requests: offered load ≈ 4.5
             // worker-sec/sec vs capacity 4 → sustained overload, queues grow.
@@ -113,6 +135,7 @@ impl WorkloadConfig {
                     at: Duration::from_millis(1500),
                     duration: Duration::from_millis(400),
                 }),
+                burst: None,
             },
             // Low CPS, cheap, long-lived: connections never close within the
             // run — final open-connection balance is the headline metric.
@@ -122,6 +145,7 @@ impl WorkloadConfig {
                 service: ProcessingTime::Fixed(Duration::from_millis(2)),
                 lifetime: Duration::from_secs(60),
                 hang: None,
+                burst: None,
             },
             // Low CPS, expensive: ~75% utilization, occasional very slow
             // connections pin workers for long stretches.
@@ -135,6 +159,22 @@ impl WorkloadConfig {
                 },
                 lifetime: Duration::from_millis(400),
                 hang: None,
+                burst: None,
+            },
+            // Case-3 accumulation, then at 2.5 s every open connection
+            // (~150 by then) fires one 5 ms follow-up request. LIFO has
+            // concentrated every connection on the head worker, which must
+            // serialize the whole backlog; balanced policies split it 4 ways.
+            WorkloadCase::Case5 => WorkloadConfig {
+                cps: 60,
+                duration: Duration::from_secs(4),
+                service: ProcessingTime::Fixed(Duration::from_millis(2)),
+                lifetime: Duration::from_secs(60),
+                hang: None,
+                burst: Some(BurstSpec {
+                    at: Duration::from_millis(2500),
+                    service: Duration::from_millis(5),
+                }),
             },
         }
     }
@@ -151,6 +191,7 @@ impl WorkloadConfig {
             },
             lifetime: Duration::from_millis(250),
             hang: None,
+            burst: None,
         }
     }
 }

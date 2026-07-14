@@ -54,6 +54,7 @@ fn main() {
         "2" => WorkloadConfig::for_case(WorkloadCase::Case2),
         "3" => WorkloadConfig::for_case(WorkloadCase::Case3),
         "4" => WorkloadConfig::for_case(WorkloadCase::Case4),
+        "5" => WorkloadConfig::for_case(WorkloadCase::Case5),
         _ => WorkloadConfig::default_case(),
     };
 
@@ -87,6 +88,7 @@ fn main() {
                     shared,
                     worker_id,
                     config.hang,
+                    config.burst,
                     policy,
                     &tick_shards[worker_id],
                     &conn_shards[worker_id],

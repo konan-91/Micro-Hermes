@@ -86,16 +86,15 @@ All configuration is via environment variables:
   Algorithm 2 (kernel `reciprocal_scale` of the connection hash into the
   candidate count, pick the Nth set bit). If ≤ 1 candidate survives, it
   falls back to plain reuseport hashing, per the paper.
-- **`lifo`** — models epoll-exclusive's wakeup mechanics: an idle worker
-  blocking in `epoll_wait` sits in the listen socket's wait queue, insertion
-  is at the *head*, and only the first entry is woken. The dispatcher
-  therefore picks the most-recently-blocked idle worker (empty queue, no
-  pending events, newest loop timestamp); when nobody is idle it hands the
-  connection to the shortest backlog, approximating the shared accept queue.
-  Baseline workers block until work arrives (like `epoll_wait(-1)`) rather
-  than on Hermes's 5 ms scheduler timer, so the wait-queue order stays
-  stable — this is what produces the real mechanism's concentration
-  pathology.
+- **`lifo`** — models epoll-exclusive's wakeup mechanics: the listen
+  socket's wait queue is ordered by `epoll_ctl(ADD)` registration, each
+  insertion at the *head*, so the order is **static** — the last-registered
+  worker is permanently preferred, and a wakeup stops at the first non-busy
+  entry from the head (paper Fig. A2/A3: "prioritized to W3 unless it is
+  busy"). The dispatcher therefore picks the highest-index idle worker
+  (empty queue, no pending events); when nobody is idle it hands the
+  connection to the shortest backlog (tie-break toward the head),
+  approximating the shared accept queue.
 - **`reuseport`** — `SO_REUSEPORT`'s stateless hash: `reciprocal_scale`
   of the 4-tuple hash across all workers, no awareness of worker state.
 
@@ -190,11 +189,11 @@ directly into pandas/matplotlib.
 - **Simulation compensations** (documented in code): `MAX_EVENTS` is small
   (4) because simulated per-event costs are ms-scale sleeps, not the real
   µs-scale — large batches would stretch iterations past the 200 ms hang
-  threshold and starve the scheduler of fresh data; baseline workers block
-  until work arrives (modelling `epoll_wait(-1)`) instead of using Hermes's
-  5 ms timer, because any periodic idle wakeup re-inserts phase-locked
-  forked workers at the wait-queue head in lock-step, rotating the LIFO
-  concentration target and artificially evening out per-worker totals.
+  threshold and starve the scheduler of fresh data. The 5 ms `epoll_wait`
+  timer applies under **every** policy, matching the paper's production
+  setting (Fig. 5b measured it under epoll exclusive); this is safe for the
+  LIFO baseline because its wait-queue priority is static, so idle wakeups
+  don't reshuffle it.
 
 ## Testing
 

@@ -92,41 +92,36 @@ fn reuseport_hash(conn_hash: u64) -> usize {
 
 /// Epoll-exclusive baseline, modeled on the kernel's actual mechanism:
 ///
-/// Each worker blocking in epoll_wait() adds a wait-queue entry for the
-/// listen socket, and `epoll_ctl(ADD)` inserts at the *head* of the queue
-/// (fs/eventpoll.c). An incoming connection wakes only the first idle entry
-/// found from the head (EPOLLEXCLUSIVE), i.e. the most recently blocked
-/// worker. Busy workers are not in the wait queue at all; if nobody is
-/// blocked, the connection sits in the shared accept queue until the next
-/// worker re-enters epoll_wait.
+/// The listen socket's wait queue is ordered by epoll_ctl(ADD) registration,
+/// with each registration inserted at the *head* of the list (fs/eventpoll.c)
+/// — so the queue order is STATIC: the last-registered worker sits at the
+/// head permanently. A wakeup traverses from the head and stops at the first
+/// non-busy worker (EPOLLEXCLUSIVE, Fig. A2). The paper's walkthrough is
+/// explicit: "new connections will be prioritized to W3 unless it is busy"
+/// (Fig. A3, W3 = last of three registered workers).
 ///
 /// Simulation using generator-visible state:
-///   • "blocked in epoll_wait" ≈ empty accept queue and zero pending events;
-///   • "head of wait queue"   ≈ the most recent last_loop_entry timestamp
-///     (each loop iteration re-blocks the worker, re-inserting it at the head);
-///   • "all busy"             ≈ hand the connection to the worker with the
-///     shortest backlog — the closest analogue to "the next worker to come
-///     back to epoll_wait drains the shared accept queue".
+///   • registration order      = fork order, so worker N-1 registered last
+///     → highest index = head of the wait queue;
+///   • "busy" (skipped in the traversal) ≈ non-empty accept queue or
+///     pending events mid-processing;
+///   • "all busy" ≈ the connection sits in the shared accept queue until a
+///     worker returns to epoll_wait — approximated by handing it to the
+///     shortest backlog (tie-break toward the wait-queue head).
 ///
-/// Net effect matches the paper's description: new connections concentrate
-/// on the most-recently-active worker (LIFO bias), while a hung worker's
-/// growing backlog keeps it out of the idle set.
+/// Net effect matches the paper: connections concentrate on the head worker
+/// (and the few behind it), while a hung worker's growing backlog keeps it
+/// out of the idle set.
 fn dispatch_lifo(shared: &SharedState) -> usize {
-    let idle = (0..NUM_WORKERS)
-        .filter(|&i| {
-            shared.queues[i].is_empty()
-                && shared.wst.slot(i).pending_events.load(Ordering::Relaxed) == 0
-        })
-        .max_by_key(|&i| shared.wst.slot(i).last_loop_entry.load(Ordering::Relaxed));
+    let idle = (0..NUM_WORKERS).rev().find(|&i| {
+        shared.queues[i].is_empty()
+            && shared.wst.slot(i).pending_events.load(Ordering::Relaxed) == 0
+    });
     if let Some(worker) = idle {
         return worker;
     }
     (0..NUM_WORKERS)
-        .min_by_key(|&i| {
-            let backlog = shared.queues[i].len() as i64;
-            // Tie-break toward the most recently active worker (LIFO bias).
-            (backlog, -shared.wst.slot(i).last_loop_entry.load(Ordering::Relaxed))
-        })
+        .min_by_key(|&i| (shared.queues[i].len(), std::cmp::Reverse(i)))
         .unwrap()
 }
 
@@ -182,16 +177,15 @@ mod tests {
     }
 
     #[test]
-    fn test_lifo_prefers_most_recently_blocked_idle_worker() {
+    fn test_lifo_prefers_last_registered_idle_worker() {
         let state = test_state();
-        // All workers idle; worker 1 blocked most recently (highest timestamp).
-        for (i, ts) in [(0usize, 100i64), (1, 400), (2, 300), (3, 200)] {
-            state.wst.slot(i).last_loop_entry.store(ts, Ordering::Relaxed);
-        }
-        assert_eq!(dispatch_lifo(&state), 1);
-        // Worker 1 becomes busy (pending events) → next idle head is worker 2.
-        state.wst.slot(1).pending_events.store(3, Ordering::Relaxed);
-        assert_eq!(dispatch_lifo(&state), 2);
+        // All idle → the last-registered worker (highest index) is the head
+        // of the wait queue and takes the connection (paper Fig. A3:
+        // "prioritized to W3 unless it is busy").
+        assert_eq!(dispatch_lifo(&state), NUM_WORKERS - 1);
+        // Head worker busy → traversal continues to the next registration.
+        state.wst.slot(NUM_WORKERS - 1).pending_events.store(3, Ordering::Relaxed);
+        assert_eq!(dispatch_lifo(&state), NUM_WORKERS - 2);
     }
 
     #[test]

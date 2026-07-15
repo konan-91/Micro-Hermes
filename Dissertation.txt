@@ -260,31 +260,31 @@ implemented faithfully, while the two elements that require a Linux
 kernel (the eBPF dispatch program and real sockets) are replaced by
 userspace stand-ins with equivalent interfaces. Phase 2, left to future
 work, replaces those stand-ins with a real eBPF program attached via
-SO_ATTACH_REUSEPORT_EBPF. The component boundaries of the Phase 1
-implementation are drawn deliberately along the kernel/userspace line so
-that this transition replaces components rather than restructuring the
-system.
+SO_ATTACH_REUSEPORT_EBPF. The Phase 1 components are divided
+deliberately along the kernel/userspace line, so that this transition
+swaps out components rather than restructuring the system.
 
 The simulation reproduces Hermes's division of labour with real
 operating-system processes. A parent process stands in for the kernel:
 it generates synthetic connection arrivals at a configurable rate,
-computes a hash standing in for the kernel's 4-tuple hash of each
+computes a hash standing in for the kernel's 4 tuple hash of each
 connection, runs the dispatch mechanism under test, and places each
 connection into the chosen worker's accept queue. Four forked child
 processes stand in for the load balancer's workers, each running the
-instrumented run-to-completion event loop from the Hermes paper:
+event loop from the Hermes paper:
 timestamp the loop entry, collect a batch of events (an epoll_wait
 analogue over the accept queue, with the paper's 5 ms timeout),
-process each event, maintain the status metrics, and, at the end of
-every iteration, run the scheduling pass. All cross-process state (the
-Worker Status Table, the candidate bitmap, and the accept queues) lives
+process each event, maintain the status metrics, and at the end of
+every iteration run the scheduling pass. The
+Worker Status Table, the candidate bitmap, and the accept queues live
 in a single region of shared anonymous memory mapped before forking.
 
-Crucially, the feedback loop is closed: a worker's load consists
-exclusively of the connections the dispatcher assigned to it, and the
+Crucially, the feedback loop is closed: a worker's load comes entirely
+from the connections the dispatcher assigned to it, and the
 dispatcher's decisions are driven by the bitmap the workers' schedulers
 publish. Scheduling decisions therefore directly shape the measured
-load distribution, which is the property the evaluation exercises.
+load distribution, which is exactly what the evaluation sets out to
+test.
 
 4.2 Worker Status Table
 
@@ -312,7 +312,7 @@ The dispatcher implements Hermes's Algorithm 2. For each new connection
 it reads the candidate bitmap from M_Sel, counts the set bits, and, if
 more than one candidate survives, scales the connection's hash into the
 candidate count using the Linux kernel's reciprocal_scale function (a
-multiply-and-shift mapping, reimplemented exactly) and selects the Nth
+multiply and shift mapping, reimplemented exactly) and selects the Nth
 set bit of the bitmap. If one or zero candidates survive, it falls back
 to plain reuseport hashing across all workers, matching the paper's
 fallback rule: dispatching every connection that arrives between
@@ -321,10 +321,10 @@ scheduler updates to a single "best" worker would itself overload it.
 Although Phase 1 executes this logic in the parent process rather than
 in the kernel, it is written under eBPF's constraints (no heap
 allocation, statically bounded loops) so that the Phase 2 port to an
-eBPF program is mechanical. M_Sel itself is modelled as a single shared
-atomic 64-bit integer, mirroring the atomic read/write guarantee that a
-single-element BPF_MAP_TYPE_ARRAY provides in the real system; only the
-internals of this component change in Phase 2.
+eBPF program is straightforward. M_Sel itself is modelled as a single shared
+atomic 64-bit integer, mirroring the atomic read/write guarantee that
+BPF_MAP_TYPE_ARRAY provides in the real system. Only the
+internals of this component will change in Phase 2.
 
 4.4 Userspace Scheduler
 
@@ -333,7 +333,7 @@ iteration: there is no dedicated scheduler process, exactly as in the
 original design. The scheduler snapshots the WST and applies three
 cascading filters in the paper's fixed priority order. The time filter
 removes workers whose last loop entry is older than a hang threshold
-(200 ms in this implementation; the paper leaves the constant
+(200 ms in this implementation, the paper leaves the constant
 implementation-defined). The connection-count filter and the
 pending-event filter each remove workers whose metric exceeds the
 candidate average plus an offset theta, which prevents the candidate
@@ -364,21 +364,21 @@ socket's wait queue is ordered by epoll_ctl registration, and each
 registration is inserted at the head of the list, so the queue order
 is static: the last-registered worker sits permanently at the head. An
 incoming connection wakes the first idle worker found by traversing
-from the head. The simulation reproduces this with generator-visible
-state: registration order is fork order, so the highest-numbered
-worker is the head of the wait queue; a worker counts as idle when its
+from the head. The simulation reproduces this using state the
+generator can see: registration order is fork order, so the
+highest-numbered worker is the head of the wait queue; a worker counts as idle when its
 accept queue is empty and it has no pending events; and when no worker
 is idle the connection goes to the shortest backlog, approximating the
 shared accept queue that the next free worker would drain. All
 workers, baseline and Hermes alike, run the paper's 5 ms epoll_wait
-timeout; why this is safe for the baseline is discussed in
-Section 5.4.
+timeout (why this is safe for the baseline is discussed in
+Section 5.4).
 
 5. Implementation
 
 5.1 Rust Toolchain and eBPF Integration
 
-Phase 1 is implemented in stable Rust with a single dependency (libc,
+Phase 1 is implemented in Rust with a single dependency (libc,
 for mmap, fork and waitpid), approximately 1,600 lines across nine
 modules, with unit tests covering the scheduler's filters, the
 dispatcher's bit manipulation, and the shared-memory queue. No eBPF
@@ -405,16 +405,28 @@ connection, modelling accept-queue overflow.
 
 5.3 Simulating the Kernel Dispatch Path
 
-The parent process paces connection arrivals against absolute
-deadlines at the workload's target connections-per-second, so sleep
-jitter does not accumulate as rate drift. Each connection carries a
-synthetic 4-tuple hash (a counter mixed with a multiplicative constant,
-optionally perturbed by a per-trial seed), a sampled per-connection
-processing cost, and a lifetime after which the receiving worker closes
-it. Workers simulate L7 processing by sleeping for the connection's
-cost; processing expense is thus a property of the connection rather
-than the worker, matching the paper's characterisation of variable L7
-cost (TLS handshakes, compression, protocol translation).
+The parent process generates connections at the workload's target
+rate (its connections-per-second). Rather than sleeping a fixed gap
+between one arrival and the next, it pins each arrival to an absolute
+point on the clock and sleeps until that time; this way, if any one
+sleep overshoots slightly, the error does not build up over the run
+and the overall rate stays on target.
+
+Each connection is given three properties when it is created. The
+first is a synthetic 4-tuple hash, which stands in for the hash the
+kernel would normally compute from a connection's addresses and
+ports; here it is produced by scrambling a simple counter with a
+fixed multiplicative constant, and an optional per-trial seed varies
+the sequence between benchmark runs. The second is a processing cost,
+sampled from a distribution. The third is a lifetime, after which the
+worker that received the connection closes it.
+
+A worker "processes" a connection simply by sleeping for that
+connection's cost. The cost is therefore a property of the connection,
+not of the worker, which matches how the paper describes real Layer 7
+work: how expensive a connection is depends on what it involves (a TLS
+handshake, compression, protocol translation) and varies from one
+connection to the next.
 
 5.4 Engineering Challenges
 

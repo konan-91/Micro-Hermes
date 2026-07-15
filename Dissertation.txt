@@ -1,6 +1,6 @@
 Micro-Hermes: An Open-Source Implementation of eBPF Load Balancing
 
-CS5099 Dissertation, Plan and Context Survey
+CS5099 Dissertation Draft
 
 Student: 250014506
 
@@ -501,11 +501,20 @@ because each request is processed faster than the next one arrives,
 the head worker is always idle again in time to be woken next, and the
 other three workers never receive anything. Micro-Hermes's tail is
 marginally higher than the baselines' (99th percentile 1.9 ms against
-1.4 ms) because, in one trial, a handful of connections (about 0.6%)
-briefly queued behind busy candidates — a direct cost of restricting
-dispatch to a candidate subset, and consistent with the paper's own
-ranking for this regime, which places plain reuseport marginally ahead
-of Hermes when load is trivially light.
+1.4 ms). The cause is structural rather than incidental: Stage 3 never
+picks the single best worker for a connection, only hashes it to one
+of a subset of roughly acceptable candidates that Stage 2 handed
+down. In one trial, about 0.6% of connections happened to hash to a
+candidate that was momentarily busier than some other worker excluded
+from that subset, and briefly queued behind it. That handful of
+connections is the price of the two-stage design - restricting the
+kernel's hash to a subset, rather than letting it pick freely among
+all workers, occasionally rules out the least-loaded one. This is
+consistent with the paper's own ranking for this regime, which places
+plain reuseport marginally ahead of Hermes when load is trivially
+light, precisely because Hermes's worker-awareness has nothing to
+protect against yet and its candidate-subset overhead shows up as pure
+cost.
 
 Case 2 (high CPS, high cost, with an injected hang). This case pushes
 the offered load slightly past what the four workers can process, so
@@ -524,37 +533,38 @@ property of the real mechanism.
 Case 3 (low CPS, long-lived connections). This case reproduces the
 paper's headline production result. Because connections never close
 within the run, every dispatch decision is permanent: mistakes
-accumulate instead of washing out, and the balance of open connections
+accumulate over time, and the balance of open connections
 at the end of the run exposes each mechanism's character. The
 epoll-exclusive model ends with a standard deviation of 104
-connections — the head worker holds all 240 connections of the run
-while the other three hold none — against 15 for Micro-Hermes and 14
+connections - the head worker holds all 240 connections of the run
+while the other three hold none - against 15 for Micro-Hermes and 14
 for reuseport. This is the same ordering the paper reports from
 production (standard deviations of 3,200, 50 and 20 for exclusive,
 reuseport and Hermes respectively). Micro-Hermes matches rather than
 beats reuseport here; Section 6.5 discusses why parity is the faithful
-expectation in this synthetic setting.
+expectation in this synthetic simulated setting.
 
 Case 4 (low CPS, high cost). With expensive requests at moderate
 utilisation (about 75%), the danger is queueing a new connection
-behind a slow one on an already-busy worker. Micro-Hermes's
+behind a slow worker which is already busy. Micro-Hermes's
 99th-percentile latency of 442 ms is less than half of reuseport's
-975 ms, precisely because it avoids doing that; reuseport, hashing
+975 ms as it avoids doing this. Reuseport, as it hashes
 blindly, cannot. The epoll-exclusive model again leads (295 ms), with
-Micro-Hermes tracking it as the paper predicts: Hermes's closed-loop
-status detection reacts with a small lag where exclusive's wakeup of
-an idle worker is immediate.
+Micro-Hermes tracking it as the paper predicts: Hermes's
+status detection reacts with a small delay where exclusive reacts 
+immediately.
 
-Case 5 (synchronized burst on long-lived connections). Cases 1 to 4
+Case 5 (synchronised burst on long term connections). Cases 1 to 4
 measure the latency of new connections, which cannot show why
 concentration is dangerous: a worker hoarding idle connections pays no
 visible penalty while they stay idle. Case 5 makes the danger
-measurable. It repeats Case 3's accumulation — by 2.5 seconds each
-policy has dispatched roughly 150 long-lived connections — and then
+measurable and shows why the thus far top performing LIFO is
+insufficient. It repeats Case 3's accumulation - by 2.5 seconds each
+policy has dispatched roughly 150 long-lived connections - and then
 every open connection fires one 5 ms follow-up request at the same
-instant, modelling the synchronized bursts (a market opening for
+instant, modelling the synchronised bursts (a market opening for
 finance traffic, a mass push notification for chat) that the WST's
-connection-count metric exists to guard against. Because a request on
+connection count metric exists to guard against. Because a request on
 an established connection can only be processed by the worker that
 owns it, the burst is processed exactly as unevenly as the connections
 were dispatched. Under the epoll-exclusive model the head worker owns
@@ -562,16 +572,15 @@ all of the connections and must work through the entire backlog alone:
 the median follow-up waits 405 ms and the 99th percentile 801 ms.
 Micro-Hermes and reuseport, having spread the same connections across
 all four workers, complete the same burst with a median of 107 ms and
-a 99th percentile of roughly 250 ms — the four-fold parallelism the
-machine actually has. This is the measured form of the trade-off the
-raw latency numbers of Cases 2 and 4 conceal: the epoll-exclusive
-model's fast dispatch coexists with a standing liability that comes
-due the moment its hoarded connections wake up.
+a 99th percentile of roughly 250 ms. This is the measured form of the
+trade-off the raw latency numbers of Cases 2 and 4 conceal: the
+epoll-exclusive model's fast dispatch coexists with a standing
+liability that comes due the moment its hoarded connections wake up.
 
 Across all five cases Micro-Hermes never collapses: where it is not
 the best policy it trails the best by a fraction of a millisecond
-(Case 1) or a bounded margin (Cases 2 and 4), whereas each baseline
-fails badly in at least one regime — epoll-exclusive on balance in
+(Case 1) or a small margin (Cases 2 and 4), whereas each baseline
+fails badly in at least one regime - epoll-exclusive on balance in
 Cases 1 and 3 and on burst latency in Case 5, reuseport on latency in
 Cases 2 and 4. This adaptability, rather than outright victory in any
 single regime, is the core property claimed for the Hermes
@@ -579,124 +588,155 @@ architecture, and the simulation reproduces it.
 
 6.3 Worker Hang Prevention Results
 
-Case 2 injects a 400 ms stall into one worker mid-run, modelling the
-edge-triggered starvation hangs that motivated Hermes. The recorded
-scheduler decisions show the mechanism operating as designed. In every
-trial the stalled worker is removed from the candidate bitmap in a
-sustained exclusion window of 300-400 ms bracketing the stall. The
-worker typically drops out of candidacy almost immediately, because it
-stalls while still holding a batch of unprocessed events and the load
-filters already exclude it on that basis; the time filter then
-guarantees the exclusion from 200 ms into the stall (the configured
-hang threshold), once the worker's loop-entry timestamp has gone
-stale. It is readmitted shortly after the stall ends, when it
-re-enters its loop and re-stamps the WST. Notably, exclusion is
-enacted by the other workers' schedulers, since the stalled worker
-cannot run its own; this confirms the value of embedding the scheduler
-in every worker rather than in a dedicated process. During the same
-window the reuseport baseline continues to assign roughly a quarter of
-new connections to the stalled worker: the failure mode that motivated
-Hermes's timestamp-based hang detection, observed directly.
+Case 2 injects a 400 ms stall into one worker mid-run, reproducing the
+kind of hang that motivated the original Hermes paper. The recorded
+scheduler decisions show the mechanism working as intended: in every
+trial, the stalled worker is removed from the candidate bitmap within
+300-400 ms of the stall starting, and readmitted shortly after it ends.
+
+The exclusion happens in two steps. Usually the worker drops out of
+candidacy almost immediately, because it stalls while still holding a
+batch of unprocessed events, and the load filters exclude it on that
+basis alone. As a backstop, the time filter guarantees exclusion by
+200 ms into the stall (the configured hang threshold) regardless, once
+the worker's loop-entry timestamp has gone stale. The worker is
+readmitted once the stall ends and it re-enters its loop, re-stamping
+the WST.
+
+Notably, this exclusion is carried out by the other workers'
+schedulers, since the stalled worker cannot run its own - confirming
+the value of embedding the scheduler in every worker rather than
+running it as a separate process. Over the same window, the reuseport
+baseline keeps assigning roughly a quarter of new connections to the
+stalled worker: exactly the failure mode that motivated Hermes's
+timestamp-based hang detection, observed directly here.
 
 6.4 Scheduler Filter Behaviour
 
 The per-stage survivor counts recorded at every scheduling pass show
-the cascading filter behaving as the paper describes. Under light load
-(Cases 1 and 3) the filters barely prune: on average 3.7 to 3.8 of the
-four workers survive all three stages. Under load the candidate set
-contracts, most sharply in the overloaded Case 2, where the mean
-surviving set falls to 2.6 of 4 workers after the third filter, with
-the event-count filter doing the most work. Case 2 is also the only
-case where the time filter prunes appreciably (a mean of 3.5 survivors
-after stage one): beyond the injected stall itself, a worker that
-spends several hundred milliseconds inside a single loop iteration
-processing a batch of slow events looks, from the WST's point of view,
-exactly like a hung worker — and is treated as one, which is arguably
-correct, since it cannot accept new work promptly either way. Overall
-this matches the paper's observation that the fraction of workers
-passing the coarse filter decreases as load increases, while theta's
-margin prevents collapse to a single candidate, which would forfeit
-the kernel-side fine-grained selection and trigger the fallback path.
+the cascading filter behaving as the paper describes. Under light
+load (Cases 1 and 3), the filters barely prune anything: on average
+3.7 to 3.8 of the four workers survive all three stages.
+
+Under heavier load, the candidate set shrinks. This is most visible in
+the overloaded Case 2, where the mean surviving set falls to 2.6 of 4
+workers after the third filter, and the event count filter does most
+of that pruning. Case 2 is also the only case where the time filter
+itself prunes appreciably (a mean of 3.5 survivors after stage one).
+This is not just the injected stall: a worker that spends several
+hundred milliseconds inside a single loop iteration processing a batch
+of slow events looks, from the WST's point of view, exactly like a
+hung worker, and gets treated as one. This is arguably correct, since
+either way it cannot accept new work promptly.
+
+Overall, this matches the paper's observation that the fraction of
+workers passing the coarse filter shrinks as load increases, while
+theta's margin stops the set collapsing to a single candidate.
+A collapse that would forfeit the kernel's fine-grained selection and
+trigger the fallback path instead.
 
 6.5 Discussion
 
 Two results deviate from the paper's rankings, and both are boundaries
 of a userspace simulation rather than defects of the architecture;
-they are recorded here as honest limitations of Phase 1.
+they are recorded here as limitations of making a userspace simulation. 
 
 First, the epoll-exclusive model wins on raw latency in Cases 2 and 4,
 whereas the paper places Hermes ahead of exclusive under high
 processing cost. This is the simulation's sharpest limitation, and it
 follows from an architectural difference between the real mechanisms
-that the Phase-1 harness does not fully honour. Real SO_REUSEPORT — and
-therefore both reuseport and Micro-Hermes, which build on it — gives
+that the Phase 1 version does not fully honour. Real SO_REUSEPORT - and
+therefore both reuseport and Micro-Hermes, which build on it - gives
 every worker its own listening socket with its own kernel accept queue,
-each worker draining only its own; the simulation reproduces this
+where each worker takes only its own queue. The simulation reproduces this
 faithfully with one queue per worker. Real epoll-exclusive is different
-in kind: all workers share a single socket and a single accept queue,
-and the kernel's only decision is which idle worker to wake to drain
+as all workers share a single socket and a single accept queue, and
+therefore the kernel's only decision is which idle worker to wake to drain
 it. Because there are no per-worker queues in that design, there is no
 per-worker backlog for it to inspect. The simulated baseline, however,
 reuses the per-worker-queue infrastructure that the other two policies
-genuinely require, and its fallback path — taken once every worker is
-busy, as under Case 2's overload — hands each connection to whichever
-of the four queues is currently shortest. That is a
-join-the-shortest-queue placement: an actively load-aware decision, and
-the reason the simulated LIFO posts strong latency and even balance
+genuinely require, and its fallback path - taken once every worker is
+busy, as under Case 2's overload - hands each connection to whichever
+of the four queues is currently shortest. This is a load-aware decision,
+and the reason the simulated LIFO posts strong latency and even balance
 together in Case 2. The real mechanism could not make that decision at
-all, being blind to per-worker backlog by construction. Our baseline is
-therefore better-informed than the system it stands in for, and its
-Case 2 and 4 latency cannot be read as a property of real
-epoll-exclusive.
+all as it is completely blind and there are no per-worker backlogs. Our
+baseline is therefore better-informed than the system it represents, and
+its Case 2 and 4 latency cannot be read as a property of real
+epoll-exclusive even though it serves as a decent approximation.
 
-Two further factors compound the effect, both in the same direction.
-Micro-Hermes is mildly handicapped against the simulated baseline: its
-candidate bitmap is refreshed only once per worker loop iteration (a
-faithful property of the real design, whose scheduler runs at the end
-of each loop) and is therefore slightly stale against the
-per-connection-fresh queue depths the baseline reads. And real
-epoll-exclusive carries kernel-side costs the simulation omits outright
-— the O(#ports) wait-queue traversal (the simulated deployment has a
-single port where production load balancers serve tens of thousands),
-the wakeup overhead, and the cache-unfriendliness that kept the
-round-robin wakeup variant out of the mainline kernel. The latency
-comparison between Micro-Hermes and exclusive should therefore be read
-as conservative towards Micro-Hermes throughout. Reproducing real
-epoll-exclusive faithfully would require building a separate
-single-shared-queue path for the baseline alone; that effort is better
-directed at Phase 2, whose real kernel dispatch answers the question
-without approximation, than at a second queue structure thrown away
-when the simulated kernel is. Case 5, meanwhile, supplies the measured
-counterweight within the simulation itself: the very concentration that
-lets the exclusive model post low dispatch latency costs it a
-three-to-four-fold latency penalty the moment its hoarded connections
-become active.
+Two further factors make this comparison harder on Micro-Hermes and
+easier on exclusive, on top of the point above.
 
-Second, Micro-Hermes only matches rather than beats reuseport's
-balance in Case 3. The paper's production advantage (a standard
-deviation of 20 against 50) arises because real connections have
-wildly uneven durations, degrading a stateless hash's balance over
-time, whereas Case 3's synthetic connections are identical and never
-close, leaving the hash near-optimal by construction. Parity is
-accordingly the faithful expectation here, and the qualitative claim
-that survives is the one that matters: the LIFO model's balance is an
-order of magnitude worse than either alternative's, and only
-status-aware dispatch avoids every failure mode observed across the
-four cases.
+First, Micro-Hermes only updates its list of candidate workers once
+per event-loop iteration - this matches how the real design works,
+since the real scheduler also runs once per loop, at the end. Between
+those updates, the list can be slightly out of date: a worker's queue
+may have changed since the list was last built. The simulated
+LIFO baseline is not limited this way - each time it dispatches a
+connection, it checks every worker's actual, current queue length
+individually, rather than working from a list built earlier. So the
+baseline always acts on fresher information than Micro-Hermes does.
 
-Finally, the paper's CPU overhead profile (0.674% to 2.436% total
+Second, real epoll-exclusive carries kernel-side costs that this
+simulation leaves out entirely. In the real mechanism, waking a
+worker means walking a wait-queue whose length grows with the number
+of ports being listened on - the simulation only ever uses one port,
+whereas a production load balancer listens on tens of thousands. On
+top of that, there is a real cost to waking a thread at all, and a
+problem of cache unfriendliness which was serious enough that Linux's
+maintainers refused to merged a round-robin fix meant to address
+exclusive's imbalance. None of these costs apply to the simulation.
+
+Both factors point the same way: they make simulated exclusive look
+better, and simulated Micro-Hermes look worse, than the real systems
+would. So the latency comparison between Micro-Hermes and exclusive
+should be read as conservative towards Micro-Hermes - the real gap
+between them is likely larger, in Micro-Hermes's favour, than these
+numbers show. Building a truly faithful simulation of epoll-exclusive
+would mean giving it its own separate single-shared-queue path,
+rather than reusing the per-worker queues that the other two
+mechanisms actually need. Instead this effort will be spent on Phase 2,
+where the real kernel dispatch settles the question directly, rather than
+a second queue structure that gets thrown away along with the rest of
+the simulated kernel.
+
+Case 5 shows the other side of this same trade-off. Exclusive's low dispatch latency comes from
+piling most connections onto one worker. That is fine as long as
+those connections stay idle - but Case 5 has all of them fire a
+request at the same moment, forcing the one worker holding them to
+process the entire burst alone. The result is a latency 3-4x worse
+than the other two mechanisms, which had spread those same connections
+across all four workers to begin with.
+
+The second deviation is that Micro-Hermes only matches, rather than
+beats, reuseport's balance in Case 3. In the paper's production data,
+reuseport's balance is worse than Hermes's (standard deviation 50
+against 20) because real connections vary wildly in duration, which
+degrades a stateless hash's balance over time. Case 3's synthetic
+connections, by contrast, are all identical and never close, so the
+hash stays near-optimal by construction and has no weakness for
+Micro-Hermes to exploit. Parity is therefore the expected result here,
+and the claim that still holds is the one that matters: the LIFO
+model's balance is an order of magnitude worse than either
+alternative's, and only status-aware dispatch avoids every failure
+mode seen across all four cases.
+
+Finally, the paper's CPU overhead figures (0.674% to 2.436% total,
 across counters, scheduler, syscalls and the eBPF dispatcher) cannot
-be meaningfully validated in a simulation whose processing consists of
-sleeps; overhead measurement is deferred to Phase 2, where flamegraph
-profiling of the real instrumented event loop becomes possible.
+be meaningfully checked here, since the simulation's "processing" is
+just sleeping rather than real work. Overhead measurement is deferred
+to Phase 2, where flamegraph profiling of the real, instrumented event
+loop becomes possible.
 
-Within its stated boundaries, the evaluation supports the central
-claims of the Hermes design: the three-stage feedback loop balances
-load more evenly than either standard Linux mechanism, detects and
-routes around hung workers within a bounded window using only three
-atomically-updated metrics, degrades gracefully to reuseport behaviour
-when its candidate set thins, and, uniquely among the three mechanisms
-tested, remains competitive in every traffic regime.
+Within these stated limits, the evaluation supports Hermes's central
+claims: the three stage feedback loop balances load more evenly than
+either standard Linux mechanism, detects and routes around hung
+workers within a bounded window using only three atomically updated
+metrics, safely falls back to plain reuseport hashing on the rare
+occasions its candidate set shrinks to one worker or none, and,
+uniquely among the three mechanisms tested, stays competitive in every
+traffic regime.
 
 References
 

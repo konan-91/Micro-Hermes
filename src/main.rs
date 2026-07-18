@@ -1,23 +1,25 @@
 //! Micro-Hermes Phase 1: userspace simulation of the Hermes load balancer.
 //!
 //! Process layout mirrors the real system's division of labor:
-//!   parent  = kernel stand-in — paces connection arrivals (workload CPS),
+//!   parent  = kernel stand-in, paces connection arrivals (workload CPS),
 //!             runs the dispatch mechanism under test (Algorithm 2 /
 //!             reuseport hash / epoll-exclusive LIFO), pushes each
 //!             connection into the chosen worker's accept queue.
 //!   children = one forked worker per slot, each running the instrumented
-//!             event loop (Fig. 9) and — under the Hermes policy — the
+//!             event loop (Fig. 9) and, under the Hermes policy, the
 //!             Algorithm-1 scheduler that feeds the M_Sel bitmap back.
 //!
 //! All cross-process state (WST, M_Sel, accept queues) lives in one
-//! mmap(MAP_SHARED | MAP_ANONYMOUS) region — see shm.rs.
+//! mmap(MAP_SHARED | MAP_ANONYMOUS) region, see shm.rs.
 //!
 //! Environment variables:
-//!   POLICY         — hermes|lifo|reuseport            (default: hermes)
-//!   WORKLOAD_CASE  — 1|2|3|4|default                  (default: default)
-//!   METRICS_PATH   — per-iteration tick CSV           (default: metrics.csv)
-//!   CONNS_PATH     — per-connection latency CSV       (default: conns.csv)
-//!   VERBOSE        — 1 to print every worker loop iteration
+//!   POLICY:         hermes|lifo|reuseport            (default: hermes)
+//!   WORKLOAD_CASE:  1|2|3|4|5|default                (default: default)
+//!   LOAD:           light|medium|heavy               (default: the case's
+//!                   characteristic level; scales offered CPS per Table 3)
+//!   METRICS_PATH:   per-iteration tick CSV           (default: metrics.csv)
+//!   CONNS_PATH:     per-connection latency CSV       (default: conns.csv)
+//!   VERBOSE:        1 to print every worker loop iteration
 
 mod dispatcher;
 mod generator;
@@ -31,11 +33,11 @@ mod wst;
 use dispatcher::Policy;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use workload::{WorkloadCase, WorkloadConfig};
+use workload::{LoadLevel, WorkloadCase, WorkloadConfig};
 use wst::NUM_WORKERS;
 
 fn main() {
-    // ── Parse environment config ───────────────────────────────────────────
+    // Parse environment config
     let case_str = std::env::var("WORKLOAD_CASE").unwrap_or_else(|_| "default".to_string());
     let policy_str = std::env::var("POLICY").unwrap_or_else(|_| "hermes".to_string());
     let metrics_path = std::env::var("METRICS_PATH").unwrap_or_else(|_| "metrics.csv".to_string());
@@ -49,13 +51,19 @@ fn main() {
         _ => Policy::Hermes,
     };
 
-    let config = match case_str.as_str() {
-        "1" => WorkloadConfig::for_case(WorkloadCase::Case1),
-        "2" => WorkloadConfig::for_case(WorkloadCase::Case2),
-        "3" => WorkloadConfig::for_case(WorkloadCase::Case3),
-        "4" => WorkloadConfig::for_case(WorkloadCase::Case4),
-        "5" => WorkloadConfig::for_case(WorkloadCase::Case5),
-        _ => WorkloadConfig::default_case(),
+    let case = match case_str.as_str() {
+        "1" => Some(WorkloadCase::Case1),
+        "2" => Some(WorkloadCase::Case2),
+        "3" => Some(WorkloadCase::Case3),
+        "4" => Some(WorkloadCase::Case4),
+        "5" => Some(WorkloadCase::Case5),
+        _ => None,
+    };
+    let load = std::env::var("LOAD").ok().and_then(|s| LoadLevel::from_env_str(&s));
+    let config = match (case, load) {
+        (Some(c), Some(l)) => WorkloadConfig::for_case_with_load(c, l),
+        (Some(c), None) => WorkloadConfig::for_case(c),
+        (None, _) => WorkloadConfig::default_case(),
     };
 
     eprintln!(
@@ -65,7 +73,7 @@ fn main() {
         config.duration,
     );
 
-    // ── Shared state + per-worker metrics shard files ──────────────────────
+    // Shared state + per-worker metrics shard files
     let shared = shm::mmap_shared_state();
 
     let shard_dir = std::env::temp_dir().join(format!("micro_hermes_shards_{}", std::process::id()));
@@ -77,7 +85,7 @@ fn main() {
     let conn_shards: Vec<PathBuf> =
         (0..NUM_WORKERS).map(|i| shard_dir.join(format!("w{i}_conns.csv"))).collect();
 
-    // ── Fork one child per worker ──────────────────────────────────────────
+    // Fork one child per worker
     let mut child_pids = Vec::with_capacity(NUM_WORKERS);
     for worker_id in 0..NUM_WORKERS {
         let pid = unsafe { libc::fork() };
@@ -100,14 +108,14 @@ fn main() {
         }
     }
 
-    // ── Parent: generate traffic (kernel stand-in), then reap children ─────
+    // Parent: generate traffic (kernel stand-in), then reap children
     let gen_stats = generator::run(shared, &config, policy, seed);
     for pid in &child_pids {
         let mut status = 0i32;
         unsafe { libc::waitpid(*pid, &mut status, 0) };
     }
 
-    // ── Merge metrics shards ────────────────────────────────────────────────
+    // Merge metrics shards
     match metrics::merge_shards(&tick_shards, &metrics_path, &metrics::tick_header()) {
         Ok(rows) => eprintln!("[metrics] {} tick rows → {metrics_path}", rows.len()),
         Err(e) => eprintln!("[main] failed to write tick CSV: {e}"),
@@ -124,7 +132,7 @@ fn main() {
     };
     let _ = std::fs::remove_dir_all(&shard_dir);
 
-    // ── Summary ─────────────────────────────────────────────────────────────
+    // Summary
     let summary = metrics::summarize_conns(&conn_lines);
     let final_open: Vec<i64> = (0..NUM_WORKERS)
         .map(|i| shared.wst.slot(i).accumulated_conns.load(Ordering::Relaxed))

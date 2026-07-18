@@ -7,11 +7,11 @@ micro-hermes simulator.
 
 | Path | What it is |
 |---|---|
-| `run_benchmarks.sh` | Runs the full matrix: 3 policies × 5 cases × `TRIALS` trials (each trial gets a distinct `SEED`). Skips result files that already exist. |
+| `run_benchmarks.sh` | Runs the full matrix: 3 policies × {4 cases × 3 load levels + case 5} × `TRIALS` trials (each trial gets a distinct `SEED`). Skips result files that already exist. |
 | `hermes_analysis.ipynb` | **The one thing to run.** Annotated notebook: generates data if missing, then produces all figures and tables. Every figure section says what the plot shows, why it is included, and gives a caption ready to paste into the dissertation. |
 | `results/` | Raw per-run CSVs (`*_ticks.csv`, `*_conns.csv`). Git-ignored; regenerate any time. |
 | `figures/` | Output figures, PNG (300 dpi, drafts) + PDF (vector, for LaTeX). |
-| `tables/` | Output tables, CSV + LaTeX. `summary_stats` is the single main table covering all five cases (Case 5's rows are the burst follow-up requests); `validation_verdicts` is the pass/fail check against the paper's expected orderings. |
+| `tables/` | Output tables, CSV + LaTeX. `summary_stats` is the single main table covering all five cases at each case's characteristic load level (Case 5's rows are the burst follow-up requests); `load_sweep` is the paper's Table-3-style light/medium/heavy sweep (mean, p99, throughput); `validation_verdicts` is the pass/fail check against the paper's expected orderings. |
 
 ## Usage
 
@@ -27,7 +27,7 @@ jupyter nbconvert --to notebook --execute --inplace hermes_analysis.ipynb
 
 Requires Python with `pandas`, `numpy`, `matplotlib` (a stock JupyterLab
 install has all three) and a Rust toolchain on `PATH` for the data-generation
-step. End-to-end runtime from empty `results/`: ≈ 3 minutes.
+step. End-to-end runtime from empty `results/`: ≈ 8 minutes.
 
 To collect more trials for tighter error bars, edit `TRIALS` in the
 notebook's first code cell (or run `TRIALS=5 ./run_benchmarks.sh` first — the

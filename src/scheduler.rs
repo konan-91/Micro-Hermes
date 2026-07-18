@@ -1,44 +1,44 @@
-//! Scheduler — Algorithm 1 (§5.2.2). Hermes-only: the lifo/reuseport
+//! Scheduler: Algorithm 1 (§5.2.2). Hermes-only: the lifo/reuseport
 //! baselines are kernel dispatch mechanisms with no userspace scheduler,
 //! so they never call into this module.
 //!
 //! Three-stage cascading filter over the WST, in fixed priority order:
-//!   Stage 1 — FilterTime : drop hung workers (stale loop timestamp)
-//!   Stage 2 — FilterCount: drop above-average(+θ) connection count
-//!   Stage 3 — FilterCount: drop above-average(+θ) pending events
+//!   Stage 1, FilterTime:  drop hung workers (stale loop timestamp)
+//!   Stage 2, FilterCount: drop above-average(+θ) connection count
+//!   Stage 3, FilterCount: drop above-average(+θ) pending events
 //!
 //! The surviving candidate set is encoded as a bitmap (Array2INT) which the
-//! worker writes into the simulated M_Sel map. This module is pure —
-//! snapshots in, bitmap out — and is intended to survive Phase 2 unchanged;
-//! only the sync target (SelMap internals) changes.
+//! worker writes into the simulated M_Sel map. This module is pure
+//! (snapshots in, bitmap out) and is intended to survive Phase 2 unchanged;
+//! only the sync target (SelMap internals) changes
 
 use crate::wst::{WorkerSnapshot, Wst, NUM_WORKERS};
 
 /// Workers whose last loop entry is older than this are considered hung.
 /// The paper leaves the value implementation-defined; 200 ms comfortably
 /// exceeds the 5 ms epoll timeout plus any healthy batch's processing time
-/// for our workloads, while catching injected hangs quickly.
+/// for our workloads, while catching injected hangs quickly
 pub const HANG_THRESHOLD_NS: i64 = 200_000_000;
 
 /// Offset θ added to the average in FilterCount (Algorithm 1). The paper's
 /// Fig. 15 finds θ/avg = 0.5 optimal, so θ scales with the average; the
-/// floor keeps the filter permissive near cold-start (avg ≈ 0), where an
-/// aggressive θ would collapse the candidate set for no reason.
+/// floor keeps the filter permissive near cold-start (avg ~ 0), where an
+/// aggressive θ would collapse the candidate set for no reason
 pub const THETA_RATIO: f64 = 0.5;
 pub const THETA_MIN: f64 = 1.0;
 
-/// Result of one scheduling pass.
+/// Result of one scheduling pass
 #[derive(Debug, Clone)]
 pub struct ScheduleResult {
-    /// Bitmap of surviving candidates (bit i → worker i). Written to M_Sel.
+    /// Bitmap of surviving candidates (bit i -> worker i). Written to M_Sel
     pub bitmap: u64,
-    /// Candidate count after each cascading stage (for metrics/CSV).
+    /// Candidate count after each cascading stage (for metrics/CSV)
     pub after_stage1: usize,
     pub after_stage2: usize,
     pub after_stage3: usize,
 }
 
-/// Run Algorithm 1 over the live WST.
+/// Run Algorithm 1 over the live WST
 pub fn schedule(wst: &Wst, now: i64, hang_threshold_ns: i64) -> ScheduleResult {
     schedule_from_snapshots(&wst.snapshot_all(), now, hang_threshold_ns)
 }
@@ -48,20 +48,20 @@ fn schedule_from_snapshots(
     now: i64,
     hang_threshold_ns: i64,
 ) -> ScheduleResult {
-    // Stage 1: FilterTime — drop workers that look hung.
+    // Stage 1: FilterTime, drop workers that look hung
     let after1: Vec<usize> = (0..NUM_WORKERS)
         .filter(|&i| {
             let t = snapshots[i].last_loop_entry;
             // Cold-start guard: last_loop_entry == 0 means the worker hasn't
-            // entered its first loop yet; treat it as alive, not hung.
+            // entered its first loop yet; treat it as alive, not hung
             t == 0 || (now - t < hang_threshold_ns)
         })
         .collect();
 
-    // Stage 2: FilterCount over connection counts.
+    // Stage 2: FilterCount over connection counts
     let after2 = filter_below_baseline(&after1, |i| snapshots[i].accumulated_conns);
 
-    // Stage 3: FilterCount over pending events.
+    // Stage 3: FilterCount over pending events
     let after3 = filter_below_baseline(&after2, |i| snapshots[i].pending_events);
 
     let bitmap = after3.iter().fold(0u64, |b, &i| b | (1u64 << i));
@@ -75,7 +75,7 @@ fn schedule_from_snapshots(
 }
 
 /// FilterCount (Algorithm 1 lines 11-13): keep candidates whose metric is
-/// below avg + θ, with θ = max(THETA_RATIO · avg, THETA_MIN).
+/// below avg + θ, with θ = max(THETA_RATIO * avg, THETA_MIN)
 fn filter_below_baseline(candidates: &[usize], metric: impl Fn(usize) -> i64) -> Vec<usize> {
     if candidates.is_empty() {
         return Vec::new();
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_high_conn_worker_filtered_stage2() {
         let now = now_monotonic_ns();
-        // Worker 3 has 100 conns; avg = 25.75, θ = 12.875, baseline ≈ 38.6.
+        // Worker 3 has 100 conns; avg = 25.75, θ = 12.875, baseline ~ 38.6
         let snaps = make_snapshots([(now, 0, 1), (now, 0, 1), (now, 0, 1), (now, 0, 100)]);
         let res = schedule_from_snapshots(&snaps, now, HANG_THRESHOLD_NS);
         assert!(res.bitmap & (1 << 3) == 0, "overloaded worker 3 must be filtered");
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_theta_floor_keeps_equal_zero_loads() {
-        // All metrics zero → avg 0, θ floors at THETA_MIN → everyone passes.
+        // All metrics zero -> avg 0, θ floors at THETA_MIN -> everyone passes
         let candidates: Vec<usize> = (0..4).collect();
         let result = filter_below_baseline(&candidates, |_| 0);
         assert_eq!(result.len(), 4, "zero-load workers must all pass");
@@ -160,8 +160,8 @@ mod tests {
 
     #[test]
     fn test_theta_scales_with_average() {
-        // Loads [10, 10, 10, 14]: avg = 11, θ = 5.5, baseline = 16.5 → all
-        // pass despite worker 3 being above average (θ prevents over-pruning).
+        // Loads [10, 10, 10, 14]: avg = 11, θ = 5.5, baseline = 16.5 -> all
+        // pass despite worker 3 being above average (θ prevents over-pruning)
         let loads = [10i64, 10, 10, 14];
         let candidates: Vec<usize> = (0..4).collect();
         let result = filter_below_baseline(&candidates, |i| loads[i]);

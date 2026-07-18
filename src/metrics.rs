@@ -1,23 +1,23 @@
-//! Metrics pipeline — structured CSV output for offline analysis/plotting.
+//! Metrics pipeline: structured CSV output for offline analysis/plotting.
 //!
 //! Two row types, two output files:
 //!
-//!   ticks CSV (METRICS_PATH, default metrics.csv) — one row per worker
+//!   ticks CSV (METRICS_PATH, default metrics.csv): one row per worker
 //!   event-loop iteration: WST snapshot, queue depth, and (Hermes only) the
 //!   Algorithm-1 stage survivors + bitmap. Drives balance-over-time plots
 //!   (conn/event standard deviation, the paper's Fig. 13 metric).
 //!
-//!   conns CSV (CONNS_PATH, default conns.csv) — one row per completed
-//!   connection: arrival → dequeue → done timestamps. latency_us
+//!   conns CSV (CONNS_PATH, default conns.csv): one row per completed
+//!   connection: arrival -> dequeue -> done timestamps. latency_us
 //!   (done - arrival, i.e. queue wait + service) drives the P99-latency
 //!   comparisons (paper Table 5 / §10).
 //!
 //! Collection plumbing: each worker buffers rows locally and writes private
 //! headerless shard files when its loop ends; the parent merges shards after
-//! waitpid. Deliberately *not* shared memory — a Vec's heap buffer isn't in
+//! waitpid. Deliberately *not* shared memory: a Vec's heap buffer isn't in
 //! the MAP_SHARED region after fork(), and std Mutexes are UB across
 //! processes on macOS (os_unfair_lock EINVAL panics). Mirrors the WST's
-//! "each worker writes only its own column" partitioning, but with files.
+//! "each worker writes only its own column" partitioning, but with files
 
 use crate::dispatcher::Policy;
 use crate::scheduler::ScheduleResult;
@@ -26,7 +26,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-/// One row per worker event-loop iteration.
+/// One row per worker event-loop iteration
 #[derive(Debug, Clone)]
 pub struct TickRow {
     pub timestamp_ns: i64,
@@ -34,7 +34,7 @@ pub struct TickRow {
     pub iter: u32,
     pub snapshots: [WorkerSnapshot; NUM_WORKERS],
     pub queue_len: usize,
-    /// Algorithm-1 output — None for the baselines (no userspace scheduler).
+    /// Algorithm-1 output, None for the baselines (no userspace scheduler)
     pub result: Option<ScheduleResult>,
     pub policy: Policy,
 }
@@ -43,7 +43,7 @@ pub struct TickRow {
 /// (kind = "accept") or a follow-up request on an established connection
 /// during a synchronized burst (kind = "burst", Case 5 only). For burst
 /// rows, arrival_ns is the moment the burst fired, so latency_us measures
-/// how long the follow-up waited behind its siblings on the owning worker.
+/// how long the follow-up waited behind its siblings on the owning worker
 #[derive(Debug, Clone)]
 pub struct ConnRow {
     pub conn_id: u64,
@@ -56,7 +56,7 @@ pub struct ConnRow {
     pub kind: &'static str,
 }
 
-/// Per-worker row buffers, flushed to shard files when the worker exits.
+/// Per-worker row buffers, flushed to shard files when the worker exits
 pub struct MetricsShards {
     pub ticks: Vec<TickRow>,
     pub conns: Vec<ConnRow>,
@@ -100,7 +100,7 @@ pub fn conn_header() -> String {
 
 fn format_tick_row(row: &TickRow) -> String {
     // Baselines have no Algorithm-1 output; write zeros so the schema is
-    // uniform across policies (simplifies pandas-side comparison).
+    // uniform across policies (simplifies pandas-side comparison)
     let (bitmap, s1, s2, s3) = match &row.result {
         Some(r) => (r.bitmap, r.after_stage1, r.after_stage2, r.after_stage3),
         None => (0, 0, 0, 0),
@@ -149,7 +149,7 @@ fn format_conn_row(row: &ConnRow) -> String {
 }
 
 impl TickRow {
-    /// One console line per iteration (enabled with VERBOSE=1).
+    /// One console line per iteration (enabled with VERBOSE=1)
     pub fn print(&self) {
         let fmt_metric = |f: fn(&WorkerSnapshot) -> i64| {
             self.snapshots.iter().map(|s| format!("{:>3}", f(s))).collect::<Vec<_>>().join(" ")
@@ -177,7 +177,7 @@ impl TickRow {
 
 /// Merge headerless shard files into `out_path` with `header`, sorted
 /// numerically by the first column (timestamp for ticks, conn_id for conns).
-/// Returns the merged data lines for further summarization.
+/// Returns the merged data lines for further summarization
 pub fn merge_shards(
     shard_paths: &[PathBuf],
     out_path: &str,
@@ -210,7 +210,7 @@ pub fn merge_shards(
     Ok(lines.into_iter().map(|(_, l)| l).collect())
 }
 
-/// Latency stats computed from merged conn-CSV lines (see conn_header).
+/// Latency stats computed from merged conn-CSV lines (see conn_header)
 #[derive(Debug, Default)]
 pub struct ConnSummary {
     pub completed: usize,
@@ -226,7 +226,7 @@ pub fn summarize_conns(lines: &[String]) -> ConnSummary {
     let mut latencies: Vec<i64> = Vec::with_capacity(lines.len());
     for line in lines {
         let fields: Vec<&str> = line.split(',').collect();
-        // Columns: see conn_header — worker_id is 1, latency_us is 7.
+        // Columns: see conn_header, worker_id is 1, latency_us is 7
         let (Some(worker), Some(latency)) = (
             fields.get(1).and_then(|f| f.parse::<usize>().ok()),
             fields.get(7).and_then(|f| f.parse::<i64>().ok()),
@@ -250,7 +250,7 @@ pub fn summarize_conns(lines: &[String]) -> ConnSummary {
     summary
 }
 
-/// Nearest-rank percentile over a sorted slice.
+/// Nearest-rank percentile over a sorted slice
 fn percentile(sorted: &[i64], p: f64) -> i64 {
     let rank = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len());
     sorted[rank - 1]

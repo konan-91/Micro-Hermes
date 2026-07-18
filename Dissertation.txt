@@ -133,6 +133,12 @@ Table of Contents
 
 10.3 Future Work
 
+Appendix A: Testing Summary
+
+Appendix B: User Manual
+
+Appendix C: Ethics Self-Assessment
+
 References
 
 1. Introduction
@@ -255,7 +261,8 @@ ethical considerations. Chapters 7 and 8 present the design and
 implementation of the Phase 1 simulation, Chapter 9 evaluates it against
 the two baseline mechanisms and against the paper's published behaviour,
 and Chapter 10 concludes with contributions, limitations, and future
-work.
+work. Appendices provide the testing summary, a user manual for
+building and reproducing every result, and the ethics self-assessment.
 
 2. Context Survey
 
@@ -326,6 +333,28 @@ in that worker's memory. Every dispatch decision is therefore
 permanent, which is what makes the dispatch mechanism worth engineering
 carefully.
 
+A third consequence follows from multi-tenancy, and it is the setting
+Hermes was built for. A cloud L7 load balancer serves many tenants from
+the same worker pool, and Alibaba's architecture isolates them by
+port: before traffic reaches the L7 LB, the layer below rewrites each
+tenant's port-80/443 traffic to a distinct destination port, and the
+L7 LB binds a separate listening socket to each port (Pan et al.,
+2025). This gives per-tenant traffic management (rate limiting,
+accounting) at port granularity, but it also means ports vastly
+outnumber workers — on the order of ten thousand ports against tens of
+workers — so every worker necessarily serves traffic from a large
+number of tenants at once. That raises the stakes of the dispatch
+decision: when one worker is overloaded, the latency penalty is not
+confined to one misbehaving tenant but shared by every tenant whose
+connections happen to be pinned there. Inter-worker load balancing is
+therefore not only a performance concern but the mechanism by which a
+multi-tenant load balancer preserves performance isolation between
+tenants. The port-per-tenant design also matters mechanically for the
+comparison in this dissertation: with epoll's shared-socket pattern,
+every worker registers interest in every port, so kernel-side wakeup
+work grows with the number of ports — a cost that will resurface in
+the evaluation (Section 9.5).
+
 2.3 Connection Scheduling Inside a Single Server
 
 When multiple workers listen for the same incoming connections, the
@@ -333,10 +362,24 @@ kernel must decide which worker accepts each one. Linux provides two
 production mechanisms, and both were designed for correctness and
 throughput rather than balance.
 
-The older pattern gives all workers one shared listening socket and has
-each register it with epoll. Historically, a new connection woke every
-waiting worker — the "thundering herd" — of which all but one found
-nothing to accept. Linux 4.5 added the EPOLLEXCLUSIVE flag so that only
+The mechanisms sit atop the kernel's I/O event notification facility.
+Early Unix multiplexing primitives — select and poll — scan the full
+descriptor set on every call and scale poorly to the tens of thousands
+of sockets a load balancer holds; BSD's kqueue (Lemon, 2001) and
+Linux's epoll replaced them with stateful interfaces whose cost tracks
+the number of *ready* descriptors rather than the number monitored,
+which is why epoll underpins essentially every high-performance Linux
+network server today.
+
+The older dispatch pattern gives all workers one shared listening
+socket and has each register it with epoll. Historically, a new
+connection woke every waiting worker — the "thundering herd" — of
+which all but one found nothing to accept. The classic userspace
+workaround, still available in NGINX as accept_mutex, serialises
+accept-side polling behind an application-level lock so only one
+worker listens at a time (NGINX, 2024) — avoiding the herd at the cost
+of putting a lock on the accept path. Linux 4.5 addressed the problem
+in the kernel instead, adding the EPOLLEXCLUSIVE flag so that only
 one waiter is woken per event (Baron, 2015a; Corbet, 2015). The
 implementation detail that matters for this dissertation is *which*
 worker gets woken: workers are inserted at the head of the socket's
@@ -370,7 +413,16 @@ load-aware only in the degenerate sense of preferring "not currently
 busy", with a LIFO bias that concentrates load; reuseport is perfectly
 unbiased but perfectly blind. Neither can incorporate what the worker
 itself knows — how many events it has pending, how many connections it
-holds, whether it is making progress at all. Getting that knowledge
+holds, whether it is making progress at all.
+
+Nor is the problem an artefact of epoll that newer interfaces resolve.
+io_uring, Linux's next-generation asynchronous I/O framework (Linux
+man-pages, 2024), wakes waiters in its default interrupt mode in a
+fixed FIFO order — a different bias from epoll exclusive's LIFO, but
+equally blind to worker load, and so equally capable of uneven
+process load (Pan et al., 2025). The blindness is structural: any
+wakeup-order policy fixed at registration time, whatever its order,
+dispatches without consulting worker state. Getting that knowledge
 into the kernel's dispatch decision requires a mechanism for running
 user-supplied logic at the socket-selection moment, which is exactly
 what eBPF provides.
@@ -405,6 +457,22 @@ helper. This is the precise hook Hermes uses: it turns the reuseport
 group's socket selection, formerly a fixed hash, into a programmable
 decision that can consult state pushed down from userspace through an
 eBPF map.
+
+The hook is not exotic — it already carries production traffic at
+several major operators, which is evidence for its maturity. Meta uses
+it to migrate established listening sockets between old and new server
+processes during software releases, achieving connection-preserving
+restarts of a multi-billion-user service (Naseer et al., 2020). NGINX
+uses it to route QUIC packets sharing a connection ID to the same
+worker (NGINX, 2021). Cloudflare contributed a sibling hook, sk_lookup,
+that lets an eBPF program choose the receiving socket before the
+standard lookup runs at all, decoupling services from the IP/port they
+are addressed by (Fayed et al., 2021). What distinguishes Hermes from
+all of these is the *input* to the programmable decision: their
+steering logic is static or application-defined (a release phase, a
+QUIC connection ID, an addressing rule), whereas Hermes closes a
+feedback loop — the selection adapts continuously to measured worker
+runtime status.
 
 This project implements in Rust, targeting the Aya library for its
 eBPF phase. Rust's ownership-based type system provides memory safety
@@ -463,6 +531,20 @@ scheduler in userspace: the kernel lacks application context, and
 eBPF's restricted programmability would make the filter logic and its
 dynamic policy updates awkward to express; only the final decision — a
 bitmap in a single integer — crosses the boundary.
+
+The paper's evaluation characterises traffic by two axes —
+connections per second and average per-connection processing time —
+yielding four regimes, and measures each mechanism in each regime at
+three offered-load levels. Its production measurements make the
+regimes concrete: across four global regions, the long-lived-
+connection regime (its Case 3) accounts for 56.2% of traffic on
+average and the expensive-processing regime (Case 4) for another
+31.7% — and these two dominant regimes are precisely where epoll
+exclusive and reuseport respectively perform worst (Pan et al., 2025).
+No single existing mechanism wins in all four regimes; Hermes's design
+goal is to be best or near-best in every one. This
+adaptability-over-victory framing is inherited by the evaluation in
+Chapter 9.
 
 The measured cost of all of this is small: 0.674%–2.436% of CPU
 depending on load, dominated under heavy load by the map-update system
@@ -536,54 +618,85 @@ kube-proxy in Kubernetes environments, providing cluster-wide load
 balancing and network policy enforcement without the overhead of
 iptables (Cilium Authors, 2024).
 
-Recent academic work continues in this direction. arkLB combines eBPF
-and XDP into an in-kernel load balancer for microservice traffic,
-targeting low latency and minimal CPU and memory consumption (Aadhitya,
-2024). CRAB removes the load balancer from the connection datapath
-altogether: it participates only in TCP connection establishment and
-then redirects the client to communicate with the chosen backend
-directly (Kogias et al., 2020); HEELS brings the same
+Academic work continues in this direction: CRAB removes the load
+balancer from the connection datapath altogether, participating only
+in TCP connection establishment before redirecting the client to the
+chosen backend directly (Kogias et al., 2020), and HEELS brings that
 connection-establishment-only idea to commodity hosts using eBPF (Yang
-& Kogias, 2023).
+& Kogias, 2023). Below the transport layer entirely, RSS++ makes the
+NIC's receive-side-scaling hash *load-aware*, reprogramming the RSS
+indirection table from measured per-core load to rebalance packet
+processing across cores (Barbette et al., 2019) — the closest thing at
+packet granularity to what Hermes does at connection granularity.
 
 These systems are all relevant prior art, but they address a
 fundamentally different problem from Micro-Hermes. Because they operate
-at Layer 4, on packets or connection establishment before any
+at or below Layer 4, on packets or connection establishment before any
 application processing, they have no visibility into application-layer
 information such as per-worker processing load, and their unit of
-placement is a backend *machine*. They cannot determine whether a
-particular worker process is idle or overwhelmed. Their goal is
-infrastructure-scale traffic distribution, not intra-server worker
-fairness.
+placement is a backend machine or a CPU core's packet queue. They
+cannot determine whether a particular worker process is idle or
+overwhelmed. Their goal is infrastructure-scale traffic distribution,
+not intra-server worker fairness.
 
 3.3 Intra-Server Request Scheduling
 
 A separate research line attacks the same intra-server problem Hermes
-targets — tail latency caused by poor assignment of work to cores — but
-from the opposite direction: rather than improving the kernel's
-dispatch decision, these systems replace the kernel's networking and
-scheduling stack outright. ZygOS builds a specialised dataplane OS that
-work-steals microsecond-scale requests across cores to approximate a
-single-queue system (Prekas et al., 2017). Shinjuku adds preemption at
-microsecond granularity, using virtualisation hardware to interrupt
-long requests so short ones are not stuck behind them (Kaffes et al.,
-2019). Shenango and Caladan reallocate whole cores between applications
-at microsecond timescales to keep latency-critical tasks responsive
-under interference (Ousterhout et al., 2019; Fried et al., 2020).
+targets — tail latency caused by poor assignment of work to cores. The
+earliest work stayed inside the stock kernel: Affinity-Accept modified
+Linux so that a connection is accepted and processed on the core that
+received its packets, giving each core a local accept queue and
+work-stealing between them, and showed substantial throughput gains
+from connection locality alone (Pesterev et al., 2012) — an intra-
+server connection-placement system a decade before Hermes, though
+driven by cache locality rather than worker load. Later systems went
+further by replacing the kernel's networking and scheduling stack
+outright: ZygOS builds a specialised dataplane OS that work-steals
+microsecond-scale requests across cores to approximate a single-queue
+system (Prekas et al., 2017). Shinjuku adds preemption at microsecond
+granularity, using virtualisation hardware to interrupt long requests
+so short ones are not stuck behind them (Kaffes et al., 2019).
+Shenango and Caladan reallocate whole cores between applications at
+microsecond timescales to keep latency-critical tasks responsive under
+interference (Ousterhout et al., 2019; Fried et al., 2020).
 
-These systems achieve substantially stronger tail-latency guarantees
-than any dispatch-time policy can, because they can correct a bad
-initial placement after the fact — stealing, preempting, or reassigning
-work that has already arrived. But they do so by replacing the
-operating system's I/O path, requiring applications to be rewritten
-against new interfaces and operators to run non-standard stacks. Hermes
-occupies a deliberately different point in the design space: it keeps
-stock Linux, stock epoll, and the existing application architecture,
-and improves only the dispatch decision, accepting that connections
-cannot move after placement (Section 2.2). Its bet is that for L7 load
-balancer workloads, getting the *initial* placement right — informed by
-live worker status — captures most of the benefit at a tiny fraction of
-the deployment cost. Micro-Hermes inherits that bet.
+These dataplane systems achieve substantially stronger tail-latency
+guarantees than any dispatch-time policy can, because they can correct
+a bad initial placement after the fact — stealing, preempting, or
+reassigning work that has already arrived. But they do so by replacing
+the operating system's I/O path, requiring applications to be
+rewritten against new interfaces and operators to run non-standard
+stacks. A softer version of the same idea is the userspace dispatcher
+pattern used by systems such as PostgreSQL: one process fetches all
+I/O events and hands them to backend workers under an explicitly fair
+policy (PostgreSQL Global Development Group, 2024). That works when
+backend jobs are expensive relative to dispatch, but for a load
+balancer facing hundreds of thousands of new connections per second
+the dispatcher itself sits on the critical path and becomes the
+bottleneck — the reason Hermes keeps dispatch in the kernel and embeds
+its scheduler inside the existing workers rather than adding a
+dispatch process (Pan et al., 2025).
+
+The kernel community has recently moved toward the same philosophy
+Hermes embodies. sched_ext, merged in Linux 6.12, lets an eBPF program
+define the kernel's *process* scheduling policy, with safety
+guaranteed by the verifier and a watchdog fallback to the default
+scheduler (Linux Kernel Documentation, 2024). Its vision — userspace-
+defined scheduling policy executed safely inside the kernel via eBPF —
+is exactly Hermes's; the difference is the scheduled object: sched_ext
+places processes onto cores, Hermes places connections onto processes.
+That the mainline kernel has adopted the pattern for the harder,
+general case strengthens the argument that eBPF-programmable dispatch
+is a durable interface rather than a niche trick.
+
+Hermes thus occupies a deliberately different point in the design
+space from the dataplane OSes: it keeps stock Linux, stock epoll, and
+the existing application architecture, and improves only the dispatch
+decision, accepting that connections cannot move after placement
+(Section 2.2). Its bet is that for L7 load balancer workloads, getting
+the *initial* placement right — informed by live worker status —
+captures most of the benefit at a tiny fraction of the deployment
+cost. Micro-Hermes inherits that bet.
 
 3.4 Layer 7 and Application-Aware Load Balancing
 
@@ -598,6 +711,23 @@ proxy hop — and, crucially for this project, they are themselves
 subject to the intra-server dispatch problem of Section 2.3: the proxy
 is exactly the kind of multi-worker epoll server whose internal
 connection distribution the kernel handles blindly.
+
+Academic work on L7 load balancers has concentrated on the layer
+*above* the single machine. Yoda decouples the L7 LB's connection
+state from the machines serving it, storing TCP state in a replicated
+store so that any instance can take over any connection, and thereby
+makes the L7 LB itself highly available and horizontally scalable
+(Gandhi et al., 2016). Later systems offload the L7 LB's work to
+hardware — SmartNICs (AccelTCP; Moon et al., 2020) or programmable
+switches — to cut its CPU cost. All of this effort treats the load
+balancer machine as a black box: how connections are spread across the
+worker processes *inside* each instance is left to the kernel
+mechanisms of Section 2.3, and, as the Hermes authors note from
+production experience, it is precisely that userspace workload
+handling, not kernel connection management, that consumes most of an
+L7 LB's CPU (Pan et al., 2025). Intra-server dispatch is therefore the
+underserved layer of the L7 load-balancing stack, and improvements to
+it compose with — rather than compete against — all of the above.
 
 The system most directly relevant to this project is Hermes (Pan et
 al., 2025), described in detail in Section 2.5: an industry system from
@@ -821,7 +951,28 @@ from the connections the dispatcher assigned to it, and the
 dispatcher's decisions are driven by the bitmap the workers' schedulers
 publish. Scheduling decisions therefore directly shape the measured
 load distribution, which is exactly what the evaluation sets out to
-test.
+test. Figure 1 shows the process layout and the shared-memory region
+connecting the two sides.
+
+[FIGURE 1 HERE — architecture diagram. To draw: two boxes joined by a
+shared-mmap region. Top box "parent process (kernel stand-in)":
+generator paces arrivals at the workload CPS → dispatcher picks a
+worker (Algorithm 2 over M_Sel / reuseport hash / LIFO model) → pushes
+into the chosen worker's accept queue. Bottom box "4 forked worker
+processes": instrumented event loop (stamp time → collect batch →
+process events → update WST) with schedule_and_sync (Algorithm 1) at
+loop end writing the candidate bitmap to M_Sel. Middle strip "shared
+anonymous memory": WST (one 64-byte slot per worker) + M_Sel (single
+atomic u64) + one SPSC accept ring per worker. Arrows: workers → WST
+(status writes); schedulers → M_Sel (bitmap store); dispatcher ← M_Sel
+(bitmap load); dispatcher → rings → workers (connections). The ASCII
+diagram in the repository README is a starting point.
+Caption: Phase 1 process architecture. A parent process stands in for
+the kernel, running the dispatch mechanism under test; four forked
+workers run the instrumented event loop. All cross-process state —
+the Worker Status Table, the M_Sel candidate bitmap, and the per-worker
+accept queues — lives in one shared anonymous memory region, and the
+feedback loop from worker status to dispatch decision is closed.]
 
 7.2 Worker Status Table
 
@@ -867,7 +1018,13 @@ internals of this component will change in Phase 2.
 
 Every worker runs Hermes's Algorithm 1 at the end of each event-loop
 iteration: there is no dedicated scheduler process, exactly as in the
-original design. The scheduler snapshots the WST and applies three
+original design. The reason is the one established in Section 3.3: a
+dedicated dispatcher or scheduler process on the connection path
+becomes a bottleneck at high connection rates and a single point of
+failure, whereas embedding the scheduler in every worker means
+scheduling continues as long as *any* worker is alive — a property the
+evaluation observes directly when a stalled worker is excluded by its
+peers' schedulers (Section 9.3). The scheduler snapshots the WST and applies three
 cascading filters in the paper's fixed priority order. The time filter
 removes workers whose last loop entry is older than a hang threshold
 (200 ms in this implementation, the paper leaves the constant
@@ -1015,28 +1172,76 @@ injected into one worker); Case 3, low CPS with low cost but
 long-lived connections that never close within the run (the
 finance/chat pattern, and the most common case in Alibaba's
 production); and Case 4, low CPS with high cost (TLS- and regex-heavy
-web services at roughly 75% utilisation). A fifth scenario, beyond the
+web services). A fifth scenario, beyond the
 paper's four, repeats Case 3's accumulation of long-lived connections
 and then fires a follow-up request on every open connection
 simultaneously, providing direct evidence for the cost of connection
 concentration (Section 9.2, Case 5).
 
-Each of the three dispatch policies is run against each case three
-times, with a per-trial seed varying the (reproducible) sequence of
-connection hashes and sampled processing costs. Two record streams are
-collected: one row per completed connection (arrival, dequeue and
-completion timestamps, so that latency includes both queueing delay
-and service time), and one row per worker event-loop iteration (a WST
-snapshot plus, for Micro-Hermes, the scheduler's per-stage survivor
-counts and bitmap). Percentiles are computed within each trial and
-then aggregated across trials. Load balance is measured as the
-standard deviation of per-worker connection counts, the metric the
-Hermes paper uses for its production comparison. The full pipeline,
-from benchmark execution to every figure and table referenced below,
-is reproducible from a single annotated Jupyter notebook in the
-project repository.
+Following the paper's Table 3 methodology, each of the four cases is
+additionally swept across three offered-load levels — light, medium
+and heavy — by scaling the case's connection arrival rate while
+holding its cost distribution fixed. Utilisation (offered load divided
+by the four workers' aggregate service capacity) spans roughly 10% to
+75% for Case 1, 45% to 112% for Case 2 (its heavy level is a sustained
+overload, and carries the injected stall), and 28% to 93% for Case 4;
+Case 3's cost is trivial, so its levels instead scale how many
+long-lived connections accumulate (120, 240 and 600 per run). The
+detailed per-case analysis in Section 9.2 uses each case's
+*characteristic* level — the level at which the scenario's defining
+behaviour is clearest (light for Case 1, where sub-capacity load
+exposes the LIFO concentration pathology in its purest form; heavy
+for Case 2, whose defining feature is the overload; medium for Cases
+3 and 4) — and the full sweep is then reported separately (Table 2)
+to test whether the rankings hold as load varies, which is where the
+paper's own rankings are defined.
+
+Each of the three dispatch policies is run against every case and
+load level three times, with a per-trial seed varying the
+(reproducible) sequence of connection hashes and sampled processing
+costs. Two record streams are collected: one row per completed
+connection (arrival, dequeue and completion timestamps, so that
+latency includes both queueing delay and service time), and one row
+per worker event-loop iteration (a WST snapshot plus, for
+Micro-Hermes, the scheduler's per-stage survivor counts and bitmap).
+Three metrics are derived, matching the paper's: latency (mean and
+99th percentile; percentiles are computed within each trial and then
+aggregated across trials), throughput (completed connections per
+second, informative once offered load approaches or exceeds
+capacity), and load balance (the standard deviation of per-worker
+connection counts, the metric the Hermes paper uses for its
+production comparison). The full pipeline, from benchmark execution
+to every figure and table referenced below, is reproducible from a
+single annotated Jupyter notebook in the project repository.
+
+[TABLE 1 HERE — analysis/tables/summary_stats.tex
+Caption: Latency and balance per dispatch policy across all five
+scenarios at each case's characteristic load level (mean over 3
+trials; p99 shown ± sd across trials). Case 5 rows are burst follow-up
+requests, measured from the burst instant.]
 
 9.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
+
+Table 1 summarises latency and balance for every scenario; Figure 2
+shows the full latency distributions (one panel per case) and Figure 3
+isolates the 99th percentile with its trial-to-trial spread. The
+following paragraphs walk through the cases in turn.
+
+[FIGURE 2 HERE — analysis/figures/fig1_latency_cdf.pdf
+Caption: Latency distributions (queueing + processing) per dispatch
+policy, one panel per workload case at its characteristic load level,
+log x-axis, trials pooled. In the light-load cases (1 and 3) the three
+policies are indistinguishable. Under load (Cases 2 and 4) reuseport's
+blind hash produces a heavy tail — it keeps assigning connections to
+busy or stalled workers — while Micro-Hermes routes around them.]
+
+[FIGURE 3 HERE — analysis/figures/fig2_p99_bars.pdf
+Caption: 99th-percentile connection latency per policy (bars: mean of
+per-trial p99; error bars: min–max across trials; note the independent
+y-scales). Under load, reuseport's p99 is roughly double
+Micro-Hermes's (Cases 2 and 4). The LIFO model's low latency in those
+cases is a simulation boundary discussed in Section 9.5, and Figure 8
+shows the liability that accompanies it.]
 
 Case 1 (high CPS, low cost). When requests are cheap and the system is
 far below capacity, all three policies deliver essentially the same
@@ -1083,7 +1288,9 @@ Case 3 (low CPS, long-lived connections). This case reproduces the
 paper's headline production result. Because connections never close
 within the run, every dispatch decision is permanent: mistakes
 accumulate over time, and the balance of open connections
-at the end of the run exposes each mechanism's character. The
+at the end of the run exposes each mechanism's character. Figure 4
+shows that balance as a trajectory over the run, and Figure 5 shows
+who actually ends up holding the work. The
 epoll-exclusive model ends with a standard deviation of 104
 connections - the head worker holds all 240 connections of the run
 while the other three hold none - against 15 for Micro-Hermes and 14
@@ -1092,6 +1299,23 @@ production (standard deviations of 3,200, 50 and 20 for exclusive,
 reuseport and Hermes respectively). Micro-Hermes matches rather than
 beats reuseport here; Section 9.5 discusses why parity is the faithful
 expectation in this synthetic simulated setting.
+
+[FIGURE 4 HERE — analysis/figures/fig3_balance_over_time.pdf
+Caption: Standard deviation of per-worker open-connection counts
+during a Case 3 run (long-lived connections; mean over trials, bands
+span min–max). Micro-Hermes and reuseport hold the imbalance near-flat
+as connections accumulate. Under the LIFO model the imbalance grows
+linearly: at this low arrival rate the wait-queue head worker is
+always idle again before the next connection arrives, so it receives
+every one.]
+
+[FIGURE 5 HERE — analysis/figures/fig4_concentration_profile.pdf
+Caption: Connections handled per worker in Case 3, ranked busiest to
+least busy within each trial (bars: mean over trials; error bars:
+min–max; dashed line: even share). Under the LIFO model the head
+worker takes all 240 connections in every trial and the remaining
+three take none. Micro-Hermes and reuseport sit close to the even
+share at every rank.]
 
 Case 4 (low CPS, high cost). With expensive requests at moderate
 utilisation (about 75%), the danger is queueing a new connection
@@ -1121,10 +1345,21 @@ all of the connections and must work through the entire backlog alone:
 the median follow-up waits 405 ms and the 99th percentile 801 ms.
 Micro-Hermes and reuseport, having spread the same connections across
 all four workers, complete the same burst with a median of 107 ms and
-a 99th percentile of roughly 250 ms. This is the measured form of the
+a 99th percentile of roughly 250 ms (Figure 8). This is the measured
+form of the
 trade-off the raw latency numbers of Cases 2 and 4 conceal: the
 epoll-exclusive model's fast dispatch coexists with a standing
 liability that comes due the moment its hoarded connections wake up.
+
+[FIGURE 8 HERE — analysis/figures/fig7_burst.pdf
+Caption: Latency of follow-up requests when every open connection
+fires one simultaneously (Case 5, ~150 open connections at burst time,
+trials pooled, measured from the burst instant). Under the LIFO model
+one worker owns every connection and must serialise the entire burst —
+the straight-diagonal CDF is the signature of a single queue draining
+at a constant rate — while Micro-Hermes and reuseport, having spread
+the same connections across all four workers, complete it 3–4x
+faster.]
 
 Across all five cases Micro-Hermes never collapses: where it is not
 the best policy it trails the best by a fraction of a millisecond
@@ -1135,13 +1370,63 @@ Cases 2 and 4. This adaptability, rather than outright victory in any
 single regime, is the core property claimed for the Hermes
 architecture, and the simulation reproduces it.
 
+Load sensitivity. The paper's rankings are defined across a sweep of
+offered load, not at a single point, so Table 2 repeats the comparison
+at light, medium and heavy load for each of the four cases, reporting
+the paper's three metrics (mean latency, P99, throughput).
+
+[TABLE 2 HERE — analysis/tables/load_sweep.tex
+Caption: The Table-3-style load sweep: mean latency, P99 and
+throughput per policy at light/medium/heavy offered load in each case
+(mean over 3 trials). Case 2's heavy level carries the injected
+stall.]
+
+The sweep confirms that the rankings above are not artefacts of one
+operating point, and reproduces the paper's central load-dependence
+claim: the value of worker-awareness grows with load. In Case 1,
+where all three policies are indistinguishable at light and medium
+load, heavy load (75% utilisation) separates them: reuseport's mean
+latency rises to 13.4 ms and its 99th percentile to 33 ms as hash
+collisions land connections behind busy workers, while Micro-Hermes
+holds 3.7 ms and 24 ms — reproducing the paper's ranking flip for
+this case, where reuseport is marginally ahead of Hermes at light
+load but behind it once load is heavy. In Cases 2 and 4 the
+Micro-Hermes-over-reuseport gap widens monotonically with load: Case
+4's mean-latency ratio grows from 1.2x at light load to 2.5x at
+medium and 2.8x at heavy, with the 99th percentile reaching 638 ms
+against 1,864 ms. Throughput tells the same story from the other
+side: once offered load approaches capacity, reuseport can no longer
+even sustain the arrival rate — at Case 2's medium level (84%
+utilisation) it completes 59 connections/s of the 75 offered where
+Micro-Hermes completes 69, and at Case 4's heavy level it completes
+35/s against Micro-Hermes's 45 — because connections hashed onto
+overloaded workers sit in queues rather than completing. Case 3 shows
+latency parity at every level, as expected: its per-connection cost
+is trivial and its failure mode is balance, not latency, which
+Figures 4 and 5 already capture. The epoll-exclusive model posts the
+lowest raw latency at every level of Cases 2 and 4 for the reason
+established in Section 9.5 — its fallback path reads per-worker
+backlogs that the real mechanism does not have — so, as throughout,
+its latency column should be read as an optimistic bound rather than
+a property of real epoll exclusive.
+
 9.3 Worker Hang Prevention Results
 
 Case 2 injects a 400 ms stall into one worker mid-run, reproducing the
 kind of hang that motivated the original Hermes paper. The recorded
 scheduler decisions show the mechanism working as intended: in every
 trial, the stalled worker is removed from the candidate bitmap within
-300-400 ms of the stall starting, and readmitted shortly after it ends.
+300-400 ms of the stall starting, and readmitted shortly after it
+ends. Figure 6 traces one such episode end to end.
+
+[FIGURE 6 HERE — analysis/figures/fig5_hang_detection.pdf
+Caption: Hang detection during a Case 2 run with a 400 ms stall
+injected into worker 0 (shaded). Top: worker 0's pending-event count
+in the WST freezes during the stall and drains after recovery.
+Bottom: worker 0's presence in the candidate bitmap — excluded at
+stall onset (guaranteed within the 200 ms hang threshold once its
+timestamp goes stale, arrow) and readmitted when it resumes and
+re-stamps the WST.]
 
 The exclusion happens in two steps. Usually the worker drops out of
 candidacy almost immediately, because it stalls while still holding a
@@ -1163,9 +1448,18 @@ timestamp-based hang detection, observed directly here.
 9.4 Scheduler Filter Behaviour
 
 The per-stage survivor counts recorded at every scheduling pass show
-the cascading filter behaving as the paper describes. Under light
+the cascading filter behaving as the paper describes (Figure 7).
+Under light
 load (Cases 1 and 3), the filters barely prune anything: on average
 3.7 to 3.8 of the four workers survive all three stages.
+
+[FIGURE 7 HERE — analysis/figures/fig6_cascade_stages.pdf
+Caption: Mean number of workers surviving each stage of the
+scheduler's cascading filter, per case (Hermes runs; error bars: ±1 sd
+across trials). Light-load cases prune almost nothing; the overloaded
+Case 2 prunes hardest, and is the only case where the hang filter
+(Stage 1) removes workers — the injected stall, plus workers stuck in
+long processing batches that are indistinguishable from hangs.]
 
 Under heavier load, the candidate set shrinks. This is most visible in
 the overloaded Case 2, where the mean surviving set falls to 2.6 of 4
@@ -1312,13 +1606,16 @@ actual mechanisms (including epoll exclusive's static LIFO wait
 queue) rather than caricatures of them.
 
 Third, an independent reproduction of the paper's qualitative claims:
-across the four published traffic regimes the simulation reproduces
-the paper's rankings wherever the simulation is competent to test them
-— Hermes beats the stateless hash decisively when workers are busy or
-hung, balances long-lived connections an order of magnitude more
-evenly than exclusive wakeup, detects an injected worker stall within
-a bounded window through the other workers' schedulers, and, uniquely
-among the three mechanisms, degrades gracefully in every regime. The
+across the four published traffic regimes, each swept over three
+offered-load levels as in the paper's evaluation, the simulation
+reproduces the paper's rankings wherever the simulation is competent
+to test them — Hermes beats the stateless hash decisively when workers
+are busy or hung, with a gap that widens monotonically with load and
+extends to throughput once offered load nears capacity; balances
+long-lived connections an order of magnitude more evenly than
+exclusive wakeup; detects an injected worker stall within a bounded
+window through the other workers' schedulers; and, uniquely among the
+three mechanisms, degrades gracefully in every regime. The
 two deviations from the paper's rankings were traced to identified
 boundaries of a userspace simulation rather than to the architecture.
 
@@ -1339,8 +1636,10 @@ is structurally better-informed than the mechanism it models (Section
 property of real epoll exclusive; the comparison is conservative
 against Micro-Hermes. The evaluation scale is deliberately small — four
 workers on one machine, synthetic traffic with identical cost
-distributions per case, three trials per cell — so the results
-establish qualitative orderings, not production performance. Finally,
+distributions per case, three trials per cell — so, although each case
+is swept across three offered-load levels, the results establish
+qualitative orderings and load trends, not production performance
+numbers. Finally,
 two of Hermes's production subsystems are out of scope entirely: the
 TCP-RST mitigation for connections already pinned to a hung worker, and
 the cluster-level anomaly detection and progressive scaling that handle
@@ -1384,14 +1683,123 @@ tied to hyperscale infrastructure; it is a small, portable idea — three
 atomic counters, two filters and a bitmap — that this project makes
 available to anyone.
 
-References
+Appendix A: Testing Summary
 
--   Aadhitya, A. (2024). arkLB: High Performance eBPF-Based Load
-    Balancer for Microservices. SSRN preprint 4680868.
-    https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4680868
+Correctness was established at three levels: unit tests over the
+algorithmic components, mechanical validation of whole-system
+behaviour against the paper's predictions, and integrity checks in the
+analysis pipeline.
+
+Unit tests (17 tests, run with cargo test) cover the components whose
+correctness the evaluation depends on:
+
+- Algorithm 1 (scheduler): the time filter marks a worker unavailable
+  once its loop-entry timestamp exceeds the hang threshold and
+  readmits it after a fresh stamp; cold-start behaviour is permissive
+  (a worker with no history is not spuriously filtered); the
+  connection-count and event-count filters prune workers above
+  average-plus-theta and no others; and theta's floor prevents the
+  candidate set collapsing when all workers are near-uniformly loaded.
+- Algorithm 2 (dispatcher): reciprocal_scale maps arbitrary 32-bit
+  hashes into [0, n) exactly as the kernel's implementation does;
+  Nth-set-bit selection returns the correct worker for every bitmap
+  and index combination tested; and the fallback rule engages when the
+  bitmap has one or zero set bits, dispatching by plain hash across
+  all workers.
+- The epoll-exclusive baseline: the wait-queue model prefers the
+  highest-registered idle worker and falls back to the shortest
+  backlog only when no worker is idle.
+- The shared-memory SPSC ring: values round-trip in order, a full ring
+  rejects rather than overwrites, and head/tail indices wrap correctly
+  past the buffer boundary.
+
+Whole-system validation is benchmark-driven. The paper's qualitative
+expectations per traffic regime were written down as explicit,
+machine-checkable predicates before the benchmarks were run (for
+example: "Case 3: LIFO's open-connection SD exceeds three times either
+alternative's" or "all cases: Hermes never posts the worst P99 outside
+measurement parity"). The analysis notebook evaluates all eight
+predicates against every run and prints a pass/fail verdict table; all
+eight hold on the submitted data. Data integrity is asserted at load
+time: every expected policy × case × load × trial combination must be
+present, and no negative latencies may exist.
+
+Debugging during development relied on the VERBOSE per-iteration trace
+(every worker loop iteration with its WST snapshot and scheduling
+decision) and on the per-run console summary, which reports per-worker
+dispatch/completion/drop counts that must reconcile with the
+generator's totals. The two artefacts recorded in Section 8.4 — the
+unsound shared-memory Mutex<Vec> and the phase-locked timer artefact
+in the LIFO baseline — were both found through these traces.
+
+Appendix B: User Manual
+
+Requirements. A stable Rust toolchain (rustup.rs); any Unix-like OS
+with libc (developed on macOS, targets Linux; no OS-specific code
+paths). The analysis pipeline additionally needs Python 3 with pandas,
+numpy and matplotlib, and Jupyter.
+
+Building and running a single simulation:
+
+    cargo run --release
+
+Configuration is via environment variables:
+
+    POLICY         hermes | lifo | reuseport      (default: hermes)
+    WORKLOAD_CASE  1 | 2 | 3 | 4 | 5 | default    (default: default)
+    LOAD           light | medium | heavy         (default: the
+                   case's characteristic level)
+    SEED           integer; varies the connection stream between
+                   trials, reproducibly                (default: 0)
+    METRICS_PATH   per-iteration tick CSV   (default: metrics.csv)
+    CONNS_PATH     per-connection CSV       (default: conns.csv)
+    VERBOSE        1 to print every worker loop iteration
+
+For example, the overloaded compression-heavy case under the Hermes
+policy:
+
+    POLICY=hermes WORKLOAD_CASE=2 LOAD=heavy cargo run --release
+
+Each run prints a summary (per-worker dispatch/completion counts,
+balance SDs, and latency percentiles) and writes the two CSVs.
+
+Reproducing every figure and table in this dissertation:
+
+    cd analysis && jupyter lab hermes_analysis.ipynb
+    # then: Kernel → Restart & Run All
+
+or headless:
+
+    jupyter nbconvert --to notebook --execute --inplace \
+        analysis/hermes_analysis.ipynb
+
+The notebook builds the simulator, runs the full benchmark matrix (3
+policies × {4 cases × 3 load levels + Case 5} × 3 trials, ≈ 8 minutes;
+existing results are reused), and regenerates all figures
+(analysis/figures/, PNG and PDF) and tables (analysis/tables/, CSV and
+LaTeX). Delete analysis/results/ to force fresh data; set TRIALS in
+the notebook's first code cell for more trials.
+
+Unit tests:
+
+    cargo test
+
+Appendix C: Ethics Self-Assessment
+
+[todo: attach the completed School of Computer Science ethics
+self-assessment / preliminary ethics form here, as referenced in
+Chapter 6.]
+
+References
 
 -   Aya Contributors. (2024). Aya: An eBPF library for the Rust
     programming language. https://github.com/aya-rs/aya
+
+-   Barbette, T., Katsikas, G. P., Maguire Jr., G. Q., & Kostić, D.
+    (2019). RSS++: load and state-aware receive side scaling.
+    Proceedings of the 15th International Conference on Emerging
+    Networking Experiments and Technologies (CoNEXT '19), 318–333.
+    https://doi.org/10.1145/3359989.3365412
 
 -   Barbette, T., Tang, C., Yao, H., Kostić, D., Maguire Jr., G. Q.,
     Papadimitratos, P., & Chiesa, M. (2020). A High-Speed
@@ -1429,10 +1837,22 @@ References
     and Implementation (NSDI 16).
     https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud
 
+-   Fayed, M., Bauer, L., Giotsas, V., Kerola, S., Majkowski, M.,
+    Odintsov, P., Sitnicki, J., Chung, T., Levin, D., Mislove, A.,
+    Wood, C. A., & Sullivan, N. (2021). The ties that un-bind:
+    decoupling IP from web services and sockets for robust addressing
+    agility at CDN-scale. Proceedings of the ACM SIGCOMM 2021
+    Conference, 433–446. https://doi.org/10.1145/3452296.3472922
+
 -   Fried, J., Ruan, Z., Ousterhout, A., & Belay, A. (2020). Caladan:
     Mitigating Interference at Microsecond Timescales. 14th USENIX
     Symposium on Operating Systems Design and Implementation (OSDI 20).
     https://www.usenix.org/conference/osdi20/presentation/fried
+
+-   Gandhi, R., Hu, Y. C., & Zhang, M. (2016). Yoda: a highly
+    available layer-7 load balancer. Proceedings of the Eleventh
+    European Conference on Computer Systems (EuroSys '16).
+    https://doi.org/10.1145/2901318.2901352
 
 -   Garrett, O. (2015). Inside NGINX: How We Designed for Performance
     & Scale. NGINX Blog.
@@ -1462,8 +1882,19 @@ References
     Cloud Computing (SoCC '20).
     https://marioskogias.github.io/docs/crab.pdf
 
+-   Lemon, J. (2001). Kqueue: A Generic and Scalable Event
+    Notification Facility. Proceedings of the FREENIX Track: 2001
+    USENIX Annual Technical Conference, 141–153.
+
+-   Linux Kernel Documentation. (2024). Extensible Scheduler Class
+    (sched_ext).
+    https://www.kernel.org/doc/html/next/scheduler/sched-ext.html
+
 -   Linux man-pages. (2023). epoll(7) — Linux Programmer's Manual.
     https://man7.org/linux/man-pages/man7/epoll.7.html
+
+-   Linux man-pages. (2024). io_uring(7) — Asynchronous I/O facility.
+    https://man7.org/linux/man-pages/man7/io_uring.7.html
 
 -   Lu, Y., Xie, Q., Kliot, G., Geller, A., Larus, J. R., & Greenberg,
     A. (2011). Join-Idle-Queue: A novel load balancing algorithm for
@@ -1492,8 +1923,28 @@ References
     scheduler. Linux Kernel Mailing List.
     https://lwn.net/Articles/230501/
 
+-   Moon, Y., Lee, S., Jamshed, M. A., & Park, K. (2020). AccelTCP:
+    Accelerating Network Applications with Stateful TCP Offloading.
+    17th USENIX Symposium on Networked Systems Design and
+    Implementation (NSDI 20).
+    https://www.usenix.org/conference/nsdi20/presentation/moon
+
+-   Naseer, U., Niccolini, L., Pant, U., Frindell, A., Dasineni, R., &
+    Benson, T. A. (2020). Zero Downtime Release: Disruption-free Load
+    Balancing of a Multi-Billion User Website. Proceedings of the ACM
+    SIGCOMM 2020 Conference, 529–541.
+    https://doi.org/10.1145/3387514.3405885
+
 -   NGINX. (2015). Socket Sharding in NGINX Release 1.9.1. NGINX Blog.
     https://www.f5.com/company/blog/nginx/socket-sharding-nginx-release-1-9-1
+
+-   NGINX. (2021). Our Roadmap for QUIC and HTTP/3 Support in NGINX.
+    NGINX Blog.
+    https://blog.nginx.org/blog/our-roadmap-quic-http-3-support-nginx
+
+-   NGINX. (2024). Core functionality: accept_mutex. NGINX
+    documentation.
+    https://nginx.org/en/docs/ngx_core_module.html#accept_mutex
 
 -   Olteanu, V., Agache, A., Voinescu, A., & Raiciu, C. (2018).
     Stateless Datacenter Load-balancing with Beamer. 15th USENIX
@@ -1519,6 +1970,15 @@ References
     N. (2013). Ananta: Cloud Scale Load Balancing. Proceedings of the
     ACM SIGCOMM 2013 Conference.
     https://doi.org/10.1145/2486001.2486026
+
+-   Pesterev, A., Strauss, J., Zeldovich, N., & Morris, R. T. (2012).
+    Improving network connection locality on multicore systems.
+    Proceedings of the 7th ACM European Conference on Computer Systems
+    (EuroSys '12), 337–350. https://doi.org/10.1145/2168836.2168870
+
+-   PostgreSQL Global Development Group. (2024). Overview of
+    PostgreSQL Internals. PostgreSQL documentation.
+    https://www.postgresql.org/docs/current/overview.html
 
 -   Prekas, G., Kogias, M., & Bugnion, E. (2017). ZygOS: Achieving Low
     Tail Latency for Microsecond-scale Networked Tasks. Proceedings of

@@ -72,7 +72,8 @@ All configuration is via environment variables:
 | Variable | Values | Default | Meaning |
 |---|---|---|---|
 | `POLICY` | `hermes` \| `lifo` \| `reuseport` | `hermes` | Dispatch mechanism under test |
-| `WORKLOAD_CASE` | `1` \| `2` \| `3` \| `4` \| `default` | `default` | Traffic profile (see below) |
+| `WORKLOAD_CASE` | `1` \| `2` \| `3` \| `4` \| `5` \| `default` | `default` | Traffic profile (see below) |
+| `LOAD` | `light` \| `medium` \| `heavy` | case's characteristic level | Offered-load level within the case (paper Table 3 sweep): scales the case's CPS, everything else fixed |
 | `METRICS_PATH` | file path | `metrics.csv` | Per-iteration tick CSV |
 | `CONNS_PATH` | file path | `conns.csv` | Per-connection latency CSV |
 | `VERBOSE` | `1` | off | Print every worker loop iteration |
@@ -104,13 +105,14 @@ The four traffic profiles from the paper (CLAUDE.md §10). Each is defined by
 connections/sec and a per-connection processing-cost distribution (cost is a
 property of the connection — SSL, compression — not the worker):
 
-| Case | Profile | Notes |
-|---|---|---|
-| `1` | High CPS, low cost | Stress/spike; ~10% utilization |
-| `2` | High CPS, high cost | Compression-heavy; sustained overload (offered load ≈ 4.5 vs capacity 4); worker 0 injects a 400 ms hang to exercise Stage-1 hang detection |
-| `3` | Low CPS, low cost | Long-lived connections (60 s lifetime; finance/chat) — final open-conn balance is the headline metric |
-| `4` | Low CPS, high cost | SSL/regex-heavy; ~75% utilization |
-| `default` | Mixed, short | Quick smoke test, not paper validation |
+| Case | Profile | Load levels (light/medium/heavy utilization) | Notes |
+|---|---|---|---|
+| `1` | High CPS, low cost | 10% / 40% / 75% | Stress/spike; characteristic level: **light** |
+| `2` | High CPS, high cost | 45% / 84% / 112% | Compression-heavy; heavy = sustained overload, characteristic level; worker 0 injects a 400 ms hang to exercise Stage-1 hang detection |
+| `3` | Low CPS, low cost | 120 / 240 / 600 accumulated conns | Long-lived connections (60 s lifetime; finance/chat) — final open-conn balance is the headline metric; characteristic level: **medium** |
+| `4` | Low CPS, high cost | 28% / 74% / 93% | SSL/regex-heavy; characteristic level: **medium** |
+| `5` | Case 3 + burst | single level | Accumulate long-lived conns, then every open conn fires one 5 ms follow-up simultaneously |
+| `default` | Mixed, short | — | Quick smoke test, not paper validation |
 
 ### Reproducing the comparison matrix
 

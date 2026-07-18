@@ -4,9 +4,54 @@ CS5099 Dissertation Draft
 
 Student: 250014506
 
+Abstract
+
+Layer 7 load balancers dispatch incoming TCP connections from the kernel
+to userspace worker processes, but the two mechanisms Linux provides for
+this — epoll's exclusive wakeup and SO_REUSEPORT's stateless hash — are
+blind to how busy each worker actually is. Because the cost of Layer 7
+work (TLS handshakes, compression, protocol translation) varies wildly
+between connections, this blindness concentrates load on a few workers,
+inflates tail latency, and keeps routing traffic to hung workers. Hermes
+(Pan et al., 2025), a production system at Alibaba Cloud, solves this by
+feeding live worker status back into the kernel through eBPF, letting an
+in-kernel program steer each new connection towards workers that
+userspace has marked as available. Hermes is closed-source. This
+dissertation presents Micro-Hermes, an open-source Rust implementation
+of the Hermes architecture, built in two phases: a complete userspace
+simulation of the three-stage feedback loop (this work), designed so
+that a subsequent phase can swap the simulated kernel components for a
+real eBPF program. The simulation uses real forked processes, shared
+memory, and lock-free atomics, and is evaluated against models of both
+standard Linux mechanisms across the paper's four traffic regimes plus a
+novel synchronised-burst scenario. The results reproduce the paper's
+central qualitative claim: neither standard mechanism is safe in every
+regime, while the Hermes design detects and routes around hung workers
+within a bounded window, balances long-lived connections an order of
+magnitude more evenly than exclusive wakeups, and remains competitive
+everywhere. Deviations from the paper's rankings are traced to
+documented boundaries of a userspace simulation.
+
+Declaration
+
+I hereby certify that this dissertation, which is approximately [insert
+word count] words in length, has been composed by me, that it is the
+record of work carried out by me and that it has not been submitted in
+any previous application for a degree. This project was conducted by me
+at the University of St Andrews from [insert month/year] to [insert
+month/year] towards fulfilment of the requirements of the University of
+St Andrews for the degree of [insert degree title] under the supervision
+of [insert name].
+
+In submitting this project report to the University of St Andrews, I
+give permission for it to be published online. I retain the copyright in
+this work.
+
+[insert date] [insert signature]
+
 Table of Contents
 
-Introduction
+1. Introduction
 
 1.1 Motivation
 
@@ -16,71 +61,424 @@ Introduction
 
 1.4 Report Structure
 
-Background
+2. Context Survey
 
-2.1 Linux Connection Scheduling Mechanisms
+2.1 A Brief History of Load Balancing
 
 2.2 The Layer 4 vs Layer 7 Distinction
 
-2.3 eBPF and Kernel Programmability
+2.3 Connection Scheduling Inside a Single Server
 
-2.4 The Hermes Architecture
+2.4 eBPF and Kernel Programmability
 
-Related Work
+2.5 The Hermes Architecture
 
-3.1 Traditional CPU and Network Scheduling
+3. Related Work
+
+3.1 Classical Scheduling and Load Balancing Theory
 
 3.2 Layer 4 eBPF Load Balancing
 
-3.3 Layer 7 and Application-Aware Load Balancing
+3.3 Intra-Server Request Scheduling
 
-3.4 Positioning Micro-Hermes
+3.4 Layer 7 and Application-Aware Load Balancing
 
-Design
+3.5 Positioning Micro-Hermes
 
-4.1 Two-Phase Approach and System Architecture Overview
+4. Requirements Specification
 
-4.2 Worker Status Table
+5. Software Engineering Process
 
-4.3 Kernel Connection Dispatcher
+6. Ethics
 
-4.4 Userspace Scheduler
+7. Design
 
-4.5 Alternative Scheduling Algorithms
+7.1 Two-Phase Approach and System Architecture Overview
 
-Implementation
+7.2 Worker Status Table
 
-5.1 Rust Toolchain and eBPF Integration
+7.3 Kernel Connection Dispatcher
 
-5.2 Shared Memory Communication
+7.4 Userspace Scheduler
 
-5.3 Simulating the Kernel Dispatch Path
+7.5 Alternative Scheduling Algorithms
 
-5.4 Engineering Challenges
+8. Implementation
 
-Evaluation
+8.1 Rust Toolchain and eBPF Integration
 
-6.1 Evaluation Framework and Methodology
+8.2 Shared Memory Communication
 
-6.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
+8.3 Simulating the Kernel Dispatch Path
 
-6.3 Worker Hang Prevention Results
+8.4 Engineering Challenges
 
-6.4 Scheduler Filter Behaviour
+9. Evaluation
 
-6.5 Discussion
+9.1 Evaluation Framework and Methodology
 
-Conclusion
+9.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
 
-7.1 Summary of Contributions
+9.3 Worker Hang Prevention Results
 
-7.2 Limitations
+9.4 Scheduler Filter Behaviour
 
-7.3 Future Work
+9.5 Discussion
 
-2. Related Work
+10. Conclusion
 
-2.1 Traditional CPU and Network Scheduling
+10.1 Summary of Contributions
+
+10.2 Limitations
+
+10.3 Future Work
+
+References
+
+1. Introduction
+
+1.1 Motivation
+
+Cloud providers place a Layer 7 (L7) load balancer in front of nearly
+every web-facing service they host. These systems terminate TLS, parse
+and route HTTP, compress responses, and translate between protocol
+versions, all at the rate of hundreds of thousands of new connections
+per second. Internally, an L7 load balancer is typically structured as
+one worker process pinned to each CPU core, each running an event loop
+over epoll (Garrett, 2015). The operating system decides which worker
+receives each new connection, and that decision matters: a connection
+assigned to an overloaded worker queues behind expensive work it cannot
+escape, because established connections cannot migrate between workers.
+
+Operational experience at Alibaba Cloud shows how badly this can go
+wrong. Pan et al. (2025) report a production incident in which a single
+worker, stuck in a read loop by a slow downstream, dragged request
+latency from 30 milliseconds to 440 seconds for every connection pinned
+to it, while the kernel — unaware the worker was hung — continued to
+assign it new connections. The root cause is architectural: the two
+mechanisms Linux offers for distributing connections across workers make
+their choice using either the wakeup order of a kernel wait queue or a
+stateless hash, and neither consults the one thing that predicts whether
+a worker can absorb more work: its actual runtime status in userspace.
+
+Hermes, the system Alibaba built in response, closes this gap with a
+feedback loop: workers publish their live status into shared memory, a
+lightweight userspace scheduler distils that status into a set of
+candidate workers, and an eBPF program inside the kernel steers each new
+connection to one of the candidates. In production it reduced daily
+worker hangs by 99.8% and infrastructure unit cost by 18.9% (Pan et al.,
+2025). But Hermes is closed-source and embedded in a proprietary
+hyperscale stack. Its architecture is published; its code, and therefore
+any independent validation of its claims, is not. This project exists to
+change that: to implement the Hermes architecture in the open, in Rust,
+and test whether its published behaviour can be reproduced outside
+Alibaba.
+
+1.2 Problem Statement
+
+The problem this dissertation addresses is twofold.
+
+First, the technical problem inherited from Hermes: kernel connection
+dispatch is blind to userspace load. epoll's exclusive wakeup mode
+prefers the most recently registered worker, concentrating connections
+onto a few workers; SO_REUSEPORT's hash spreads connections evenly on
+average but keeps dispatching to workers that are overloaded, hung, or
+crashed. L7 processing cost varies by orders of magnitude between
+connections and is unknowable at dispatch time, so per-worker load
+diverges even under a perfectly uniform hash. Only userspace knows how
+loaded a worker really is; only the kernel decides where connections go.
+A correct solution must carry information across that boundary cheaply
+and safely.
+
+Second, the research problem this project takes on: Hermes demonstrates
+a solution at hyperscale, but as a closed system its results cannot be
+independently reproduced, its architecture cannot be studied or extended
+by others, and organisations without Alibaba's infrastructure cannot
+adopt it. Can the Hermes architecture be reimplemented faithfully from
+its published description, and does the reimplementation reproduce the
+qualitative behaviour the paper claims — in particular its adaptability
+across traffic regimes and its bounded-time detection of hung workers?
+
+1.3 Aims and Objectives
+
+The aim of the project is a faithful, open-source implementation of the
+Hermes architecture, developed in two phases: Phase 1 (this
+dissertation) implements and evaluates the complete three-stage feedback
+loop as a userspace simulation, with the kernel-resident pieces replaced
+by stand-ins that preserve their interfaces; Phase 2 (future work)
+replaces those stand-ins with a real eBPF program. The objectives, in
+order of importance:
+
+O1. Implement the full Hermes feedback loop in Rust: the shared-memory
+Worker Status Table with its three atomically updated metrics, the
+per-worker cascading-filter scheduler (Algorithm 1), and the
+per-connection dispatcher (Algorithm 2), preserving the paper's
+lock-free concurrency design and its division between kernel and
+userspace components.
+
+O2. Implement baseline dispatch mechanisms modelling the two standard
+Linux alternatives — SO_REUSEPORT's stateless hash and epoll exclusive's
+LIFO wakeup — against which Hermes can be compared under identical
+workloads.
+
+O3. Reproduce the paper's evaluation methodology: its four traffic
+regimes (crossing high/low connection rate with low/high per-connection
+cost), an injected worker hang, and its headline balance metric (the
+standard deviation of per-worker connection counts), and validate the
+implementation against the paper's qualitative rankings rather than only
+raw numbers.
+
+O4. Extend the evaluation beyond the paper with a scenario that directly
+measures the cost of connection concentration: a synchronised burst of
+requests across accumulated long-lived connections, the failure mode the
+Worker Status Table's connection-count metric exists to guard against.
+
+O5. (Stretch) Begin the Phase 2 port of the dispatch path to a real eBPF
+program attached via SO_ATTACH_REUSEPORT_EBPF using the Aya toolchain.
+
+Objectives O1–O4 were achieved in full: the simulation implements every
+architectural element of the published design, and the evaluation in
+Chapter 9 reproduces the paper's qualitative claims within documented
+simulation boundaries. O5 was deliberately scoped out of Phase 1, but
+the codebase is structured so that the port replaces components rather
+than restructuring the system (Section 7.1).
+
+1.4 Report Structure
+
+Chapter 2 surveys the context: the history of load balancing, the
+Layer 4 / Layer 7 distinction, the Linux mechanisms for distributing
+connections inside a single server, eBPF, and the Hermes architecture
+itself. Chapter 3 reviews related work and positions Micro-Hermes
+within it. Chapter 4 specifies the requirements the software had to
+meet, and Chapter 5 describes the development process. Chapter 6 records
+ethical considerations. Chapters 7 and 8 present the design and
+implementation of the Phase 1 simulation, Chapter 9 evaluates it against
+the two baseline mechanisms and against the paper's published behaviour,
+and Chapter 10 concludes with contributions, limitations, and future
+work.
+
+2. Context Survey
+
+2.1 A Brief History of Load Balancing
+
+Load balancing — distributing incoming work across a pool of servers so
+that no one server becomes a bottleneck — is nearly as old as the web
+itself. The earliest widely deployed mechanism was round-robin DNS,
+standardised in the mid-1990s, in which a name server hands out a
+rotating list of addresses for the same hostname (Brisco, 1995). DNS
+balancing is coarse: it cannot see server load, cannot react to
+failures faster than caches expire, and offers no per-connection
+control. Through the late 1990s and 2000s the industry answer was the
+dedicated hardware appliance — a middlebox terminating traffic for a
+virtual IP and spreading it across backends — alongside early
+software alternatives in the operating system kernel, most notably the
+Linux Virtual Server project, which added transport-layer (Layer 4)
+load balancing directly into Linux (Zhang, 2000).
+
+Hardware appliances scale poorly in cost and flexibility, and the
+hyperscalers eventually replaced them with scale-out software load
+balancers running on commodity machines. Microsoft's Ananta split the
+load balancer into a replicated control plane and a scale-out data
+plane of software muxes (Patel et al., 2013); Google's Maglev showed a
+single commodity server saturating 10 Gbps line rate using consistent
+hashing to keep connection-to-backend mappings stable as the pool
+changes (Eisenbud et al., 2016). Subsequent research pushed the same
+frontier further: Beamer removed per-connection state from the balancer
+entirely by leveraging state already held at the backends (Olteanu et
+al., 2018), and Cheetah made per-connection consistency a guarantee
+rather than a probabilistic property (Barbette et al., 2020).
+
+All of these systems answer the question "which machine should serve
+this connection?". This dissertation is concerned with the question one
+level down, which arises after the machine has been chosen: which
+worker process on that machine should serve it? The same imbalance
+problem recurs there in miniature — uneven work sizes, stateless
+assignment, workers that hang — but the mechanisms available are
+different, because the "scheduler" is the operating system kernel and
+the "servers" are processes sharing its cores.
+
+2.2 The Layer 4 vs Layer 7 Distinction
+
+Load balancers are conventionally divided by the network layer at which
+they operate. A Layer 4 (L4) balancer forwards packets: it selects a
+backend using the connection's addressing 5-tuple, rewrites or
+encapsulates headers, and never inspects payload. Its per-connection
+cost is small and roughly uniform, proportional to packet count. A
+Layer 7 (L7) balancer, by contrast, terminates the connection and
+operates on application content: it performs the TLS handshake, parses
+HTTP, routes on headers or paths, compresses responses, and translates
+between protocol versions (HAProxy Technologies, 2024). Widely deployed
+examples include HAProxy, NGINX and Envoy.
+
+Two consequences of the L7 role matter here. First, per-connection cost
+is highly variable and unknowable in advance: one connection may need a
+full TLS handshake plus regex routing while its neighbour is a cheap
+keep-alive request, and which is which only becomes apparent during
+processing. Queue depth, the classic L4 load signal, is therefore a
+poor proxy for L7 load. Second, the standard L7 server architecture is
+a set of worker processes, one pinned to each CPU core, each running a
+run-to-completion event loop over epoll; NGINX popularised this design
+and documents it in detail (Garrett, 2015). Connections are pinned to
+the worker that accepts them for their entire lifetime — migrating
+established connections across workers is not practical, since the
+connection's protocol state (TLS session, parser state, buffers) lives
+in that worker's memory. Every dispatch decision is therefore
+permanent, which is what makes the dispatch mechanism worth engineering
+carefully.
+
+2.3 Connection Scheduling Inside a Single Server
+
+When multiple workers listen for the same incoming connections, the
+kernel must decide which worker accepts each one. Linux provides two
+production mechanisms, and both were designed for correctness and
+throughput rather than balance.
+
+The older pattern gives all workers one shared listening socket and has
+each register it with epoll. Historically, a new connection woke every
+waiting worker — the "thundering herd" — of which all but one found
+nothing to accept. Linux 4.5 added the EPOLLEXCLUSIVE flag so that only
+one waiter is woken per event (Baron, 2015a; Corbet, 2015). The
+implementation detail that matters for this dissertation is *which*
+worker gets woken: workers are inserted at the head of the socket's
+wait queue when they register, the queue is traversed from the head on
+each wakeup, and traversal stops at the first idle worker. The net
+effect is LIFO selection — the most recently registered (and, in steady
+state, most recently active) worker is preferred, so connections
+concentrate on a few workers while others starve. Cloudflare measured
+exactly this in production NGINX: one worker absorbing the bulk of new
+connections while the last worker received almost none (Majkowski,
+2017). A patch adding a round-robin wakeup mode (EPOLLROUNDROBIN) was
+proposed alongside EPOLLEXCLUSIVE to fix the imbalance, but was never
+merged into the mainline kernel, in part because rotating the wait
+queue is cache-unfriendly (Baron, 2015b; Corbet, 2015).
+
+The newer pattern is SO_REUSEPORT, added in Linux 3.9, which lets each
+worker bind its own listening socket to the same port; the kernel then
+selects a socket — and hence a worker — per connection using a
+stateless hash of the connection's 4-tuple (Kerrisk, 2013). Each worker
+gets a private accept queue, removing the shared-queue contention and
+the thundering herd entirely; NGINX's adoption of it ("socket
+sharding") measured 2–3x higher connection throughput (NGINX, 2015).
+The hash spreads connections evenly *in expectation*, but it is blind:
+it does not know that one worker is stuck in a slow TLS handshake, or
+hung, or dead — it keeps hashing a fixed 1/N share of new connections
+to a worker regardless of the worker's state, and hash collisions under
+heavy-hitter traffic can skew even the expectation.
+
+The two mechanisms thus fail in complementary ways: exclusive wakeup is
+load-aware only in the degenerate sense of preferring "not currently
+busy", with a LIFO bias that concentrates load; reuseport is perfectly
+unbiased but perfectly blind. Neither can incorporate what the worker
+itself knows — how many events it has pending, how many connections it
+holds, whether it is making progress at all. Getting that knowledge
+into the kernel's dispatch decision requires a mechanism for running
+user-supplied logic at the socket-selection moment, which is exactly
+what eBPF provides.
+
+2.4 eBPF and Kernel Programmability
+
+The Berkeley Packet Filter began as a small in-kernel virtual machine
+for running user-supplied packet filters safely at capture time
+(McCanne & Jacobson, 1993). Linux's extended BPF (eBPF) generalises the
+idea into a kernel-wide extension mechanism: programs written against a
+restricted instruction set are verified by a kernel-side static
+verifier — which proves memory safety and termination before the
+program is admitted — then JIT-compiled and attached to hook points
+throughout the kernel, from system-call tracing to network packet
+processing (Vieira et al., 2020; eBPF.io, 2024). Verified safety is
+what distinguishes eBPF from kernel modules: a buggy eBPF program is
+rejected at load time rather than crashing the kernel. The price is
+programmability: no unbounded loops, no heap allocation, bounded
+program size, and communication with userspace only through typed
+shared "maps" — key/value structures readable and writable from both
+sides.
+
+In networking, eBPF programs attach at several layers. At the lowest,
+XDP runs programs in the network driver before the kernel stack ever
+sees the packet, enabling line-rate packet processing on commodity
+hardware (Høiland-Jørgensen et al., 2018). Higher up — and central to
+this project — the SO_ATTACH_REUSEPORT_EBPF socket option (Linux 4.5)
+attaches an eBPF program to a SO_REUSEPORT socket group, letting the
+program override the kernel's default hash and choose *which socket*
+receives each incoming connection via the bpf_sk_select_reuseport
+helper. This is the precise hook Hermes uses: it turns the reuseport
+group's socket selection, formerly a fixed hash, into a programmable
+decision that can consult state pushed down from userspace through an
+eBPF map.
+
+This project implements in Rust, targeting the Aya library for its
+eBPF phase. Rust's ownership-based type system provides memory safety
+without garbage collection, making it suited to systems code on both
+sides of the kernel boundary (Matsakis & Klock, 2014); Aya is a pure-
+Rust eBPF library that compiles eBPF programs and manages maps without
+depending on the C libbpf toolchain (Aya Contributors, 2024).
+
+2.5 The Hermes Architecture
+
+Hermes (Pan et al., 2025) is Alibaba Cloud's answer to the blindness
+described in Section 2.3, deployed in production in front of
+multi-tenant cloud traffic and published at SIGCOMM 2025. Its central
+idea is to treat the userspace worker's runtime status as a first-class
+scheduling input, and to feed it back into the kernel's dispatch
+decision through eBPF. The architecture is a closed feedback loop in
+three stages.
+
+Stage 1 (status update): each worker maintains three metrics in a
+shared-memory Worker Status Table (WST) as a side effect of its normal
+event loop: the timestamp of its most recent loop entry (a liveness
+signal — a hung worker stops re-entering its loop), the number of
+epoll events delivered but not yet handled (a proxy for instantaneous
+processing load; the paper found event count alone correlates well
+enough with processing time, whereas packet sizes are only known after
+processing), and its count of open connections (a guard against future
+overload when many idle, long-lived connections burst simultaneously).
+Each metric is an individual atomic integer; the table is partitioned
+so each worker writes only its own column, and readers take no locks —
+occasional stale reads are accepted by design as harmless to a
+scheduling heuristic.
+
+Stage 2 (userspace scheduling): at the end of every event-loop
+iteration, each worker — there is no dedicated scheduler process — runs
+a three-stage cascading filter over the whole WST: drop workers whose
+timestamp is stale (hung), then drop workers with above-average
+connection counts, then drop workers with above-average pending events,
+each "average" softened by an offset θ that prevents the candidate set
+from collapsing. The surviving candidate set is encoded as a bitmap and
+written into an eBPF map with a single atomic store.
+
+Stage 3 (kernel dispatch): on each new connection, an eBPF program
+attached via SO_ATTACH_REUSEPORT_EBPF reads the bitmap, hashes the
+connection's 4-tuple into the number of set bits, and selects the
+corresponding candidate's socket. If one or zero candidates survive,
+the program falls back to the kernel's default reuseport hash.
+
+The division of labour between Stages 2 and 3 is deliberate: new
+connections can arrive at hundreds of thousands per second, far faster
+than any userspace scheduler can refresh its decision, so userspace
+performs coarse-grained filtering (a set of acceptable workers) and the
+kernel performs fine-grained per-connection selection within that set.
+Publishing a single "best" worker instead would funnel every connection
+arriving between updates onto it. Equally deliberate is keeping the
+scheduler in userspace: the kernel lacks application context, and
+eBPF's restricted programmability would make the filter logic and its
+dynamic policy updates awkward to express; only the final decision — a
+bitmap in a single integer — crosses the boundary.
+
+The measured cost of all of this is small: 0.674%–2.436% of CPU
+depending on load, dominated under heavy load by the map-update system
+calls rather than by the eBPF dispatcher itself, which costs at most
+0.043% (Pan et al., 2025). The production impact was large: a 99.8%
+reduction in daily worker hangs, an 18.9% reduction in infrastructure
+unit cost, and per-worker connection-count balance (standard deviation
+20) an order of magnitude better than epoll exclusive (3,200) and
+better than reuseport (50). Hermes, however, is closed-source: the
+paper publishes the architecture and algorithms in enough detail to
+reimplement, but no code or data. That gap is the opening for this
+project.
+
+3. Related Work
+
+3.1 Classical Scheduling and Load Balancing Theory
 
 The problem of distributing work across CPU cores has a long history in
 operating systems research. Classical CPU schedulers, such as the
@@ -99,157 +497,296 @@ operate at the traffic level rather than the application level and do
 not address the worker-level fairness problem that arises inside a
 single server process.
 
-While historical OS scheduling shares the core goal of distributing
-uneven workloads fairly, it operates in a completely different
-environment. Older research provides a helpful conceptual framework, but
-it does not offer a direct technical solution for routing tasks inside a
-single server application.
+The theory of randomised load balancing supplies two results that
+illuminate Hermes's design, even though the paper does not cite them.
+The "power of two choices" result shows that adding even a tiny amount
+of load information to random assignment — sampling two queues and
+picking the shorter — improves the maximum queue length exponentially
+over blind random placement (Mitzenmacher, 2001); Hermes's coarse
+candidate filter can be read as an engineered variant of the same
+principle, constraining a blind hash to a load-vetted subset.
+Join-Idle-Queue goes further and is structurally the closest
+theoretical ancestor of Hermes's design: idle processors register
+themselves in an "idle queue" that dispatchers consult at assignment
+time, decoupling the communication of load information from the
+dispatch critical path (Lu et al., 2011). Hermes's candidate bitmap is
+exactly such a precomputed availability structure — maintained
+asynchronously by the workers, consulted synchronously (and nearly for
+free) by the kernel at each connection arrival.
 
-2.2 Linux Connection Scheduling Mechanisms
+While this scheduling lineage shares the core goal of distributing
+uneven workloads fairly, it operates in different environments —
+cluster dispatchers, packet queues, or abstract queueing models. It
+provides the conceptual framework, but not a mechanism for the specific
+setting here: routing kernel-accepted connections between the worker
+processes of a single server.
 
-Modern Linux provides two primary mechanisms for distributing incoming
-connections across multiple workers: epoll_exclusive and SO_REUSEPORT.
+3.2 Layer 4 eBPF Load Balancing
 
-epoll_exclusive, introduced in Linux 4.5, allows multiple threads to
-wait on the same epoll file descriptor such that only one thread is
-woken per event, avoiding thundering herd issues (Linux man-pages,
-2023a). However, it offers no insight into worker busyness. The kernel
-selects a worker without knowing whether it is already processing a
-heavy or long-lived request.
-
-SO_REUSEPORT allows multiple sockets to bind to the same port, with the
-kernel distributing incoming connections across them using a hash of the
-source address and port (Linux man-pages, 2023b). This is statistically
-fair across many connections but is equally blind to application-level
-worker state. A worker that happens to receive several slow or expensive
-connections will become overloaded while others sit idle.
-
-Both mechanisms are widely used in high-performance servers (nginx,
-envoy, etc.) precisely because of their simplicity and low overhead. The
-limitation they share, blindness to userspace worker status, is the
-central problem Micro-Hermes addresses.
-
-2.3 eBPF and Kernel Programmability
-
-eBPF (extended Berkeley Packet Filter) allows user-defined programs to
-be safely injected into the Linux kernel at designated hook points,
-verified by a kernel-side verifier before execution (eBPF.io, 2024).
-Originally designed for packet filtering, eBPF has expanded into a
-general-purpose kernel extension mechanism used for tracing, security
-enforcement, and networking.
-
-In the networking context, eBPF programs can be attached at various
-layers of the kernel stack. The XDP (eXpress Data Path) hook sits at the
-network driver layer, allowing programs to process raw packets before
-they enter the kernel networking stack which makes it suitable for
-ultra-low-latency packet forwarding. The SO_ATTACH_REUSEPORT_EBPF socket
-option, by contrast, hooks into the socket selection layer and allows an
-eBPF program to override the kernel's default reuseport hashing logic,
-deciding which socket receives each new connection. This is the hook
-used by Hermes, and by Micro-Hermes.
-
-The eBPF verifier ensures that injected programs cannot crash the kernel
-or loop infinitely, making this a safe mechanism for extending kernel
-behaviour without kernel module development. Toolchains such as Aya (a
-Rust-native eBPF library) allow eBPF programs to be written and loaded
-from Rust, which is the approach taken in this project.
-
-2.4 Layer 4 eBPF Load Balancing
-
-A significant body of recent work applies eBPF at Layer 4 (the transport
-layer) for load balancing across clusters of servers. These systems are
-designed for high-throughput packet forwarding in data centre
-environments.
+A significant body of recent work applies eBPF at Layer 4 (the
+transport layer) for load balancing across clusters of servers. These
+systems are designed for high-throughput packet forwarding in data
+centre environments.
 
 Meta's Katran is a widely deployed example: it uses eBPF and XDP to
 perform consistent-hash-based load balancing across backend servers at
 line rate, handling tens of millions of packets per second per core
-(Manekar & Narayanan, 2018). Cilium similarly leverages eBPF to replace
+(Shirokov & Dasineni, 2018). Cilium similarly leverages eBPF to replace
 kube-proxy in Kubernetes environments, providing cluster-wide load
 balancing and network policy enforcement without the overhead of
 iptables (Cilium Authors, 2024).
 
-Recent academic work has continued in this direction. arkLB proposes an
-adaptive, rack-aware Layer 4 load balancer using eBPF and XDP, targeting
-data centre topologies to reduce cross-rack traffic (will get citation
-later!). HEELS and the CRAB load balancer represent further efforts to
-improve consistency and efficiency of packet-level forwarding using
-kernel bypass techniques (here also, lv4 balancers so do not need to
-explain in depth).
+Recent academic work continues in this direction. arkLB combines eBPF
+and XDP into an in-kernel load balancer for microservice traffic,
+targeting low latency and minimal CPU and memory consumption (Aadhitya,
+2024). CRAB removes the load balancer from the connection datapath
+altogether: it participates only in TCP connection establishment and
+then redirects the client to communicate with the chosen backend
+directly (Kogias et al., 2020); HEELS brings the same
+connection-establishment-only idea to commodity hosts using eBPF (Yang
+& Kogias, 2023).
 
-These systems are all highly relevant as prior art, but they address a
+These systems are all relevant prior art, but they address a
 fundamentally different problem from Micro-Hermes. Because they operate
-at Layer 4, on raw packets before the kernel's networking stack
-processes them, they have no visibility into application-layer
-information such as HTTP headers, TLS session state, or per-worker
-processing loads. They cannot determine whether a particular worker
-process is idle or overwhelmed. Their goal is infrastructure-scale
-traffic distribution, not intra-server worker fairness.
+at Layer 4, on packets or connection establishment before any
+application processing, they have no visibility into application-layer
+information such as per-worker processing load, and their unit of
+placement is a backend *machine*. They cannot determine whether a
+particular worker process is idle or overwhelmed. Their goal is
+infrastructure-scale traffic distribution, not intra-server worker
+fairness.
 
-2.5 Layer 7 and Application-Aware Load Balancing
+3.3 Intra-Server Request Scheduling
+
+A separate research line attacks the same intra-server problem Hermes
+targets — tail latency caused by poor assignment of work to cores — but
+from the opposite direction: rather than improving the kernel's
+dispatch decision, these systems replace the kernel's networking and
+scheduling stack outright. ZygOS builds a specialised dataplane OS that
+work-steals microsecond-scale requests across cores to approximate a
+single-queue system (Prekas et al., 2017). Shinjuku adds preemption at
+microsecond granularity, using virtualisation hardware to interrupt
+long requests so short ones are not stuck behind them (Kaffes et al.,
+2019). Shenango and Caladan reallocate whole cores between applications
+at microsecond timescales to keep latency-critical tasks responsive
+under interference (Ousterhout et al., 2019; Fried et al., 2020).
+
+These systems achieve substantially stronger tail-latency guarantees
+than any dispatch-time policy can, because they can correct a bad
+initial placement after the fact — stealing, preempting, or reassigning
+work that has already arrived. But they do so by replacing the
+operating system's I/O path, requiring applications to be rewritten
+against new interfaces and operators to run non-standard stacks. Hermes
+occupies a deliberately different point in the design space: it keeps
+stock Linux, stock epoll, and the existing application architecture,
+and improves only the dispatch decision, accepting that connections
+cannot move after placement (Section 2.2). Its bet is that for L7 load
+balancer workloads, getting the *initial* placement right — informed by
+live worker status — captures most of the benefit at a tiny fraction of
+the deployment cost. Micro-Hermes inherits that bet.
+
+3.4 Layer 7 and Application-Aware Load Balancing
 
 Layer 7 load balancers operate at the application layer and can make
-routing decisions based on application-level information such as request
-type, headers, or session affinity. Software load balancers such as
-HAProxy and Nginx perform Layer 7 load balancing in userspace, typically
-acting as reverse proxies that accept all connections and forward them
-to backends (HAProxy Technologies, 2024). While flexible and
-feature-rich, these systems introduce additional latency from the proxy
-hop and are not designed for the intra-server, kernel-level dispatching
-problem.
+routing decisions based on application-level information such as
+request type, headers, or session affinity. Software load balancers
+such as HAProxy and NGINX perform Layer 7 load balancing in userspace,
+typically acting as reverse proxies that accept all connections and
+forward them to backends (HAProxy Technologies, 2024). While flexible
+and feature-rich, these systems introduce additional latency from the
+proxy hop — and, crucially for this project, they are themselves
+subject to the intra-server dispatch problem of Section 2.3: the proxy
+is exactly the kind of multi-worker epoll server whose internal
+connection distribution the kernel handles blindly.
 
-The paper most directly relevant to this project is Hermes (Pan et al.,
-2025), an industry system from Alibaba Cloud that tackles the worker
-overload problem at Layer 7 using an eBPF-based approach. Hermes
-introduces a Worker Status Table (WST) maintained in shared memory, into
-which application workers continuously write their real-time load
-metrics (pending events, accumulated connections, and timestamps). An
-eBPF hook at the SO_ATTACH_REUSEPORT_EBPF layer reads this table at
-connection arrival time and dispatches each new connection to the
-least-loaded available worker, preventing overload before it occurs. The
-results reported are striking and resulted in a 99.8% reduction in daily
-worker hangs and an 18.9% reduction in infrastructure unit cost in
-production at Alibaba Cloud.
+The system most directly relevant to this project is Hermes (Pan et
+al., 2025), described in detail in Section 2.5: an industry system from
+Alibaba Cloud that makes the kernel's intra-server dispatch decision
+status-aware using shared memory and eBPF, reporting a 99.8% reduction
+in daily worker hangs in production. Hermes is closed-source and
+operates at hyperscale within a proprietary infrastructure stack;
+Micro-Hermes aims to reproduce its core architecture in an open-source,
+single-node Rust implementation, validating the approach at smaller
+scale and making it accessible outside Alibaba.
 
-Hermes is closed-source, however, and operates at hyperscale within a
-proprietary infrastructure stack. Micro-Hermes aims to reproduce the
-core architecture in an open-source, single-node Rust implementation,
-validating the approach at smaller scale and making it accessible to
-organisations without Alibaba-scale infrastructure.
+XLB is a related recent system that removes the sidecar proxy from
+microservice communication by placing L7 load balancing logic directly
+in the kernel's socket layer using eBPF (Wang et al., 2026). Rather
+than requiring service A to route via a sidecar proxy to reach service
+B, XLB intercepts inter-service messages in the kernel and consults an
+internal load map to determine which instance of B should receive the
+request, reporting up to 1.5x higher throughput and 60% lower latency
+than Istio and Cilium sidecars. Like Hermes, XLB demonstrates that
+kernel-level, status-aware dispatch can outperform proxy-based
+approaches. Unlike Hermes (and Micro-Hermes), XLB targets inter-service
+communication between microservice instances rather than intra-server
+worker dispatch, making it a complementary rather than directly
+competing approach.
 
-XLB (Peking University, 2026) is a related recent system that removes
-the sidecar proxy from microservice communication by placing load
-balancing logic directly in eBPF at the kernel level. Rather than
-requiring service A to route via a sidecar proxy to reach service B, XLB
-intercepts inter-service messages in the kernel and consults an internal
-load map to determine which instance of B should receive the request.
-Like Hermes, XLB demonstrates that kernel-level, status-aware dispatch
-can outperform proxy-based approaches. Unlike Hermes (and Micro-Hermes),
-XLB targets inter-server microservice communication rather than
-intra-server worker dispatch, making it a complementary rather than
-directly competing approach.
+3.5 Positioning Micro-Hermes
 
-2.6 Positioning Micro-Hermes
-
-The related work above reveals a clear gap: while Layer 4 eBPF load
-balancing is mature and well-studied, application-aware intra-server
-dispatching (preventing individual worker processes from becoming
-overloaded while others sit idle) remains largely the domain of
+The related work above reveals a clear gap. Layer 4 eBPF load balancing
+is mature and well-studied (Section 3.2); intra-server scheduling
+research achieves strong guarantees but demands replacing the OS stack
+(Section 3.3); and application-aware intra-server dispatching that
+works with stock Linux — preventing individual worker processes from
+becoming overloaded while others sit idle — remains the domain of
 proprietary, closed-source industry systems like Hermes. Open-source,
-reproducible implementations that validate and democratise this approach
-are absent from the literature.
+reproducible implementations that validate and democratise this
+approach are absent from the literature.
 
-Micro-Hermes addresses this gap by providing an open-source, single-node
-implementation of the Hermes architecture in Rust. It targets the same
-SO_ATTACH_REUSEPORT_EBPF hook, implements the Worker Status Table in
-shared memory, and benchmarks the resulting system against standard
-Linux mechanisms. In doing so it both validates the original paper's
-claims at smaller scale and provides a foundation that smaller
-organisations can build on.
+Micro-Hermes addresses this gap by providing an open-source,
+single-node implementation of the Hermes architecture in Rust. It
+targets the same SO_ATTACH_REUSEPORT_EBPF hook, implements the Worker
+Status Table in shared memory, and benchmarks the resulting system
+against models of the standard Linux mechanisms. In doing so it both
+validates the original paper's claims at smaller scale and provides a
+foundation that smaller organisations can build on.
 
-4. Design
+4. Requirements Specification
 
-4.1 Two-Phase Approach and System Architecture Overview
+The requirements follow from the project's nature as a replication: the
+published system is the specification, and fidelity to it is the
+primary requirement. Requirements are prioritised using MoSCoW
+(must/should/could). Functional requirements FR1–FR7 define Phase 1's
+faithful core; FR8 extends the evaluation; FR9 defines the Phase 2
+boundary.
+
+Functional requirements:
+
+FR1 (must). Implement the Worker Status Table in shared anonymous
+memory visible to all worker processes, holding per worker the three
+metrics of the paper (loop-entry timestamp, pending-event count, open-
+connection count), each individually atomic, partitioned so each worker
+writes only its own slot, and read without locks.
+
+FR2 (must). Implement Algorithm 1 (the scheduler): the cascading
+time → connection-count → event-count filter in the paper's fixed
+priority order, with the offset θ set to half the candidate average
+(the paper's empirically optimal ratio), producing a candidate bitmap
+written to the simulated eBPF map as a single atomic integer.
+
+FR3 (must). Implement Algorithm 2 (the dispatcher): count the bitmap's
+set bits, scale the connection's 4-tuple hash into the candidate count
+using the kernel's reciprocal_scale mapping, select the Nth set bit,
+and fall back to plain reuseport hashing when one or zero candidates
+survive.
+
+FR4 (must). Implement the paper's instrumented event loop in each
+worker: timestamp at loop entry, batch event collection with the
+paper's 5 ms timeout, per-event busy-count maintenance, connection
+count maintenance on accept/close, and a scheduling pass at the end of
+every iteration.
+
+FR5 (must). Implement two baseline dispatch policies under identical
+infrastructure: SO_REUSEPORT's stateless hash, and a model of epoll
+exclusive's static LIFO wait-queue wakeup.
+
+FR6 (must). Implement a workload generator reproducing the paper's four
+traffic regimes (high/low connection rate × low/high per-connection
+cost), including long-lived connections and an injectable mid-run
+worker stall, paced precisely at a configurable connections-per-second.
+
+FR7 (must). Record two metric streams sufficient for the evaluation:
+per-connection records (arrival, dequeue, completion timestamps) and
+per-loop-iteration records (WST snapshot, and for Hermes the
+scheduler's per-stage survivor counts and bitmap), with seeded,
+reproducible trials.
+
+FR8 (should). Implement a fifth scenario beyond the paper — a
+synchronised burst of follow-up requests across accumulated long-lived
+connections — to directly measure the cost of connection concentration.
+
+FR9 (could — Phase 2). Replace the simulated dispatch path with a real
+eBPF program attached via SO_ATTACH_REUSEPORT_EBPF, real SO_REUSEPORT
+sockets, and a real epoll loop.
+
+Non-functional requirements:
+
+NFR1 (must). Concurrency fidelity: no locks anywhere in the WST, the
+candidate-map handoff, or the accept queues; per-field atomicity only,
+accepting racy cross-field reads exactly as the paper does.
+
+NFR2 (must). Portability of the kernel-facing code: the dispatcher must
+be written within eBPF's constraints (no heap allocation, statically
+bounded loops) so the Phase 2 port is mechanical.
+
+NFR3 (must). Reproducibility: the full benchmark matrix and every
+figure and table in the dissertation must regenerate from one command,
+with per-trial seeds making runs repeatable.
+
+NFR4 (should). Fidelity over raw performance: where the simulation must
+deviate from the real system (e.g. millisecond-scale simulated work),
+the deviation must be documented and its effect on conclusions argued
+(Sections 8.4, 9.5).
+
+NFR5 (should). Minimal dependencies: Phase 1 uses only the Rust
+standard library plus libc (for mmap/fork/waitpid), keeping the
+simulation auditable.
+
+5. Software Engineering Process
+
+The project is a single-developer replication study, and the process
+was chosen to fit that shape: a fixed external specification (the
+published paper), high correctness stakes in concurrent code, and an
+evaluation whose targets are known in advance.
+
+Development began with a close study of the Hermes paper, from which a
+design document was extracted recording every architectural commitment
+the implementation would need to honour — the three metrics and their
+update points, the filter order, θ, the bitmap encoding, the fallback
+rule, the lock-free rules, and the paper's qualitative expectations per
+traffic regime. This document served as the project's requirements
+baseline (Chapter 4 is derived from it) and as the arbiter whenever an
+implementation shortcut was tempting: if the paper specified it, the
+simulation had to honour it; if the paper left it open (such as the
+hang threshold constant), the choice was recorded as
+implementation-defined.
+
+Because the requirements were fixed up front, the macro-process was
+plan-driven: the two-phase structure (userspace simulation first, eBPF
+port second) and the kernel/userspace component split were decided
+before any code was written, specifically so that Phase 2 would replace
+components rather than restructure the system. Within that frame,
+implementation proceeded iteratively in vertical slices: shared-memory
+region first, then the WST, the scheduler, the dispatcher, the worker
+loop, the workload generator, and finally the benchmark harness — each
+slice accompanied by unit tests before moving on. The test suite
+encodes the paper's algorithms as executable checks: hang detection and
+θ behaviour for Algorithm 1, reciprocal_scale ranges and Nth-set-bit
+selection and the single/zero-candidate fallback for Algorithm 2, the
+LIFO wait-queue model, and the lock-free queue's wrap-around and
+overflow behaviour.
+
+Verification of the whole system, as opposed to its parts, was
+benchmark-driven: the paper's qualitative rankings per traffic regime
+were written down as explicit validation targets before the benchmarks
+were run, and the analysis pipeline checks them mechanically and prints
+pass/fail verdicts (Section 9.1). Version control (git) was used
+throughout, with the analysis notebook, benchmark scripts and results
+kept in-repository so that the entire evaluation is reproducible from a
+clean checkout. Deviations discovered during development — the metrics
+plumbing across fork(), the phase-locked timer artefact in the LIFO
+baseline, the batch-size compensation — were treated as first-class
+engineering records and are reported in Section 8.4 rather than
+silently patched.
+
+6. Ethics
+
+The project raises no ethical concerns requiring approval. It involves
+no human participants, no user studies, no personal data, and no
+deployment against real traffic: all benchmark traffic is synthetic,
+generated and consumed within a single machine. The artefact evaluated
+is the author's own code. The system replicated is described in a
+peer-reviewed publication (Pan et al., 2025); no proprietary code,
+data, or confidential material from Alibaba was used or available —
+the reimplementation works exclusively from the published paper, which
+is standard and encouraged research practice (independent replication).
+The completed ethics self-assessment form is included as an appendix.
+
+7. Design
+
+7.1 Two-Phase Approach and System Architecture Overview
 
 Micro-Hermes is developed in two phases. Phase 1, the subject of this
 dissertation, is a complete userspace simulation of Hermes's three-stage
@@ -286,7 +823,7 @@ publish. Scheduling decisions therefore directly shape the measured
 load distribution, which is exactly what the evaluation sets out to
 test.
 
-4.2 Worker Status Table
+7.2 Worker Status Table
 
 The WST follows the layout described by Pan et al. (2025): one slot per
 worker holding the three status metrics, each stored as an individually
@@ -306,7 +843,7 @@ by design, since per-field atomicity prevents torn values and a
 marginally stale metric does not meaningfully change a scheduling
 decision.
 
-4.3 Kernel Connection Dispatcher
+7.3 Kernel Connection Dispatcher
 
 The dispatcher implements Hermes's Algorithm 2. For each new connection
 it reads the candidate bitmap from M_Sel, counts the set bits, and, if
@@ -326,7 +863,7 @@ atomic 64-bit integer, mirroring the atomic read/write guarantee that
 BPF_MAP_TYPE_ARRAY provides in the real system. Only the
 internals of this component will change in Phase 2.
 
-4.4 Userspace Scheduler
+7.4 Userspace Scheduler
 
 Every worker runs Hermes's Algorithm 1 at the end of each event-loop
 iteration: there is no dedicated scheduler process, exactly as in the
@@ -349,10 +886,10 @@ loop, and therefore to refresh its timestamp and re-run the scheduler,
 at least once every 5 ms even with no traffic at all, keeping both
 hang detection and the candidate set live under idle conditions.
 
-4.5 Alternative Scheduling Algorithms
+7.5 Alternative Scheduling Algorithms
 
 Two baseline dispatch mechanisms are implemented for comparison,
-modelling the standard Linux mechanisms described in Section 2.2. Under
+modelling the standard Linux mechanisms described in Section 2.3. Under
 the reuseport baseline, the dispatcher applies reciprocal_scale to the
 connection hash across all workers unconditionally, reproducing
 SO_REUSEPORT's stateless behaviour: no awareness of worker state, and
@@ -372,11 +909,11 @@ is idle the connection goes to the shortest backlog, approximating the
 shared accept queue that the next free worker would drain. All
 workers, baseline and Hermes alike, run the paper's 5 ms epoll_wait
 timeout (why this is safe for the baseline is discussed in
-Section 5.4).
+Section 8.4).
 
-5. Implementation
+8. Implementation
 
-5.1 Rust Toolchain and eBPF Integration
+8.1 Rust Toolchain and eBPF Integration
 
 Phase 1 is implemented in Rust with a single dependency (libc,
 for mmap, fork and waitpid), approximately 1,600 lines across nine
@@ -388,7 +925,7 @@ written, the M_Sel wrapper exposes the same store/load interface as an
 Aya array-map handle, and the WST and scheduler carry over unchanged
 since they remain in userspace in the real system.
 
-5.2 Shared Memory Communication
+8.2 Shared Memory Communication
 
 All cross-process state lives in one structure mapped with
 mmap(MAP_SHARED | MAP_ANONYMOUS) before forking, so the parent and all
@@ -403,7 +940,7 @@ sufficient and the design remains lock-free throughout, mirroring the
 WST's partitioned-writer principle. A full ring rejects the
 connection, modelling accept-queue overflow.
 
-5.3 Simulating the Kernel Dispatch Path
+8.3 Simulating the Kernel Dispatch Path
 
 The parent process generates connections at the workload's target
 rate (its connections-per-second). Rather than sleeping a fixed gap
@@ -428,7 +965,7 @@ work: how expensive a connection is depends on what it involves (a TLS
 handshake, compression, protocol translation) and varies from one
 connection to the next.
 
-5.4 Engineering Challenges
+8.4 Engineering Challenges
 
 Three issues encountered during implementation are worth recording.
 First, metrics collection across fork(): an early design accumulated
@@ -464,9 +1001,9 @@ hang-detection threshold and starve the scheduler of fresh status
 data. The batch limit is therefore kept small (4 events), preserving
 the paper's property that scheduler frequency scales with load.
 
-6. Evaluation
+9. Evaluation
 
-6.1 Evaluation Framework and Methodology
+9.1 Evaluation Framework and Methodology
 
 The evaluation reproduces the four traffic regimes used by Pan et al.
 (2025), characterised by connections-per-second (CPS) and
@@ -482,7 +1019,7 @@ web services at roughly 75% utilisation). A fifth scenario, beyond the
 paper's four, repeats Case 3's accumulation of long-lived connections
 and then fires a follow-up request on every open connection
 simultaneously, providing direct evidence for the cost of connection
-concentration (Section 6.2, Case 5).
+concentration (Section 9.2, Case 5).
 
 Each of the three dispatch policies is run against each case three
 times, with a per-trial seed varying the (reproducible) sequence of
@@ -499,7 +1036,7 @@ from benchmark execution to every figure and table referenced below,
 is reproducible from a single annotated Jupyter notebook in the
 project repository.
 
-6.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
+9.2 Benchmarks: Micro-Hermes vs reuseport vs epoll_exclusive
 
 Case 1 (high CPS, low cost). When requests are cheap and the system is
 far below capacity, all three policies deliver essentially the same
@@ -538,7 +1075,7 @@ The gap has a simple cause: reuseport's hash does not know that a
 worker is busy or stalled, so it keeps sending roughly a quarter of
 all new connections to the stalled worker for the full duration of
 the stall, while Micro-Hermes routes around it. The epoll-exclusive
-model posts the lowest latency of all (mean 414 ms); Section 6.5
+model posts the lowest latency of all (mean 414 ms); Section 9.5
 explains why this is a boundary of the simulation rather than a
 property of the real mechanism.
 
@@ -553,7 +1090,7 @@ while the other three hold none - against 15 for Micro-Hermes and 14
 for reuseport. This is the same ordering the paper reports from
 production (standard deviations of 3,200, 50 and 20 for exclusive,
 reuseport and Hermes respectively). Micro-Hermes matches rather than
-beats reuseport here; Section 6.5 discusses why parity is the faithful
+beats reuseport here; Section 9.5 discusses why parity is the faithful
 expectation in this synthetic simulated setting.
 
 Case 4 (low CPS, high cost). With expensive requests at moderate
@@ -563,7 +1100,7 @@ behind a slow worker which is already busy. Micro-Hermes's
 975 ms as it avoids doing this. Reuseport, as it hashes
 blindly, cannot. The epoll-exclusive model again leads (295 ms), with
 Micro-Hermes tracking it as the paper predicts: Hermes's
-status detection reacts with a small delay where exclusive reacts 
+status detection reacts with a small delay where exclusive reacts
 immediately.
 
 Case 5 (synchronised burst on long term connections). Cases 1 to 4
@@ -598,7 +1135,7 @@ Cases 2 and 4. This adaptability, rather than outright victory in any
 single regime, is the core property claimed for the Hermes
 architecture, and the simulation reproduces it.
 
-6.3 Worker Hang Prevention Results
+9.3 Worker Hang Prevention Results
 
 Case 2 injects a 400 ms stall into one worker mid-run, reproducing the
 kind of hang that motivated the original Hermes paper. The recorded
@@ -623,7 +1160,7 @@ baseline keeps assigning roughly a quarter of new connections to the
 stalled worker: exactly the failure mode that motivated Hermes's
 timestamp-based hang detection, observed directly here.
 
-6.4 Scheduler Filter Behaviour
+9.4 Scheduler Filter Behaviour
 
 The per-stage survivor counts recorded at every scheduling pass show
 the cascading filter behaving as the paper describes. Under light
@@ -647,11 +1184,11 @@ theta's margin stops the set collapsing to a single candidate.
 A collapse that would forfeit the kernel's fine-grained selection and
 trigger the fallback path instead.
 
-6.5 Discussion
+9.5 Discussion
 
 Two results deviate from the paper's rankings, and both are boundaries
 of a userspace simulation rather than defects of the architecture;
-they are recorded here as limitations of making a userspace simulation. 
+they are recorded here as limitations of making a userspace simulation.
 
 First, the epoll-exclusive model wins on raw latency in Cases 2 and 4,
 whereas the paper places Hermes ahead of exclusive under high
@@ -750,33 +1287,225 @@ occasions its candidate set shrinks to one worker or none, and,
 uniquely among the three mechanisms tested, stays competitive in every
 traffic regime.
 
+10. Conclusion
+
+10.1 Summary of Contributions
+
+This dissertation set out to reimplement, in the open, a closed-source
+production system known only from its published description, and to
+test whether that description is sufficient to reproduce the system's
+claimed behaviour. Its contributions are:
+
+First, the implementation itself: to the author's knowledge the first
+open-source implementation of the Hermes architecture — the
+shared-memory Worker Status Table, the per-worker cascading-filter
+scheduler, and the hash-among-candidates dispatcher — written in
+approximately 1,600 lines of dependency-light Rust, with the paper's
+lock-free concurrency design preserved exactly and the kernel-facing
+logic already written within eBPF's constraints for the Phase 2 port.
+
+Second, a simulation methodology that keeps the architecture honest:
+real forked processes communicating through genuinely shared memory,
+a closed feedback loop in which scheduling decisions alone shape the
+measured load distribution, and baselines that model the kernel's
+actual mechanisms (including epoll exclusive's static LIFO wait
+queue) rather than caricatures of them.
+
+Third, an independent reproduction of the paper's qualitative claims:
+across the four published traffic regimes the simulation reproduces
+the paper's rankings wherever the simulation is competent to test them
+— Hermes beats the stateless hash decisively when workers are busy or
+hung, balances long-lived connections an order of magnitude more
+evenly than exclusive wakeup, detects an injected worker stall within
+a bounded window through the other workers' schedulers, and, uniquely
+among the three mechanisms, degrades gracefully in every regime. The
+two deviations from the paper's rankings were traced to identified
+boundaries of a userspace simulation rather than to the architecture.
+
+Fourth, an extension of the paper's evaluation: the synchronised-burst
+scenario (Case 5) converts the paper's argument for the
+connection-count metric from a rationale into a measurement, showing
+the exclusive model's apparently strong latency coexisting with a 3-4x
+burst-latency liability created by its connection hoarding.
+
+10.2 Limitations
+
+The central limitation is that Phase 1 validates the architecture, not
+the kernel mechanism: no eBPF program runs, no real sockets exist, and
+the paper's CPU overhead profile cannot be checked against work that
+consists of sleeps. Within the simulation, the epoll-exclusive baseline
+is structurally better-informed than the mechanism it models (Section
+9.5), so its winning latency in Cases 2 and 4 must not be read as a
+property of real epoll exclusive; the comparison is conservative
+against Micro-Hermes. The evaluation scale is deliberately small — four
+workers on one machine, synthetic traffic with identical cost
+distributions per case, three trials per cell — so the results
+establish qualitative orderings, not production performance. Finally,
+two of Hermes's production subsystems are out of scope entirely: the
+TCP-RST mitigation for connections already pinned to a hung worker, and
+the cluster-level anomaly detection and progressive scaling that handle
+node-wide overload.
+
+10.3 Future Work
+
+The immediate next step is Phase 2, for which the codebase was
+structured from the start: replace the simulated dispatcher with a real
+eBPF program attached via SO_ATTACH_REUSEPORT_EBPF (written with Aya),
+give each worker a real SO_REUSEPORT listening socket registered in a
+BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, and drive the system with a real
+traffic generator over real epoll. The WST, scheduler, and worker
+instrumentation carry over unchanged, since they live in userspace in
+the real system too. Phase 2 settles the questions the simulation
+cannot: the true latency ordering against real epoll exclusive, and
+the CPU overhead profile, measurable by flamegraph against the paper's
+published 0.674%–2.436% envelope.
+
+Beyond Phase 2, several directions follow naturally. Scaling the worker
+count towards production-like values (the paper's deployments run tens
+of workers over tens of thousands of ports) would test the bitmap
+encoding and filter behaviour at realistic width. Implementing the
+paper's exception-handling path — proactive TCP RST of connections
+pinned to a hung worker, forcing clients to reconnect through the
+healthy dispatch path — would complete the reliability story. The
+scheduler itself invites experimentation the closed system cannot
+offer: alternative filter orderings, dynamic θ tuning, or entirely
+different candidate-selection policies can be evaluated against the
+same benchmark harness. Finally, the production pitfalls Alibaba
+reports downstream of even balancing — per-worker round-robin restart
+skew and reduced backend connection reuse — suggest a companion
+investigation into worker-shared backend connection pools.
+
+The broader conclusion is encouraging for replication research: a
+carefully written systems paper, even without released code, contained
+enough architectural detail to rebuild its system's behaviour — and
+where this reimplementation diverged, the divergences were explicable
+from first principles. Status-aware dispatch of the Hermes kind is not
+tied to hyperscale infrastructure; it is a small, portable idea — three
+atomic counters, two filters and a bitmap — that this project makes
+available to anyone.
+
 References
 
--   eBPF.io. (2024). What is eBPF? https://ebpf.io/
+-   Aadhitya, A. (2024). arkLB: High Performance eBPF-Based Load
+    Balancer for Microservices. SSRN preprint 4680868.
+    https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4680868
 
--   Cilium Authors. (2024). Cilium: eBPF-based networking, security, and
-    observability. https://cilium.io/
+-   Aya Contributors. (2024). Aya: An eBPF library for the Rust
+    programming language. https://github.com/aya-rs/aya
+
+-   Barbette, T., Tang, C., Yao, H., Kostić, D., Maguire Jr., G. Q.,
+    Papadimitratos, P., & Chiesa, M. (2020). A High-Speed
+    Load-Balancer Design with Guaranteed Per-Connection-Consistency.
+    17th USENIX Symposium on Networked Systems Design and
+    Implementation (NSDI 20).
+    https://www.usenix.org/conference/nsdi20/presentation/barbette
+
+-   Baron, J. (2015a). epoll: add EPOLLEXCLUSIVE flag [kernel patch
+    posting, merged in Linux 4.5]. https://lwn.net/Articles/667087/
+
+-   Baron, J. (2015b). epoll: introduce round robin wakeup mode
+    [kernel patch posting, unmerged]. https://lwn.net/Articles/634781/
+
+-   Brisco, T. (1995). DNS Support for Load Balancing. RFC 1794,
+    Internet Engineering Task Force.
+    https://www.rfc-editor.org/rfc/rfc1794
+
+-   Cilium Authors. (2024). Cilium: eBPF-based networking, security,
+    and observability. https://cilium.io/
+
+-   Corbet, J. (2015). Epoll evolving. LWN.net.
+    https://lwn.net/Articles/633422/
 
 -   Demers, A., Keshav, S., & Shenker, S. (1989). Analysis and
     simulation of a fair queuing algorithm. ACM SIGCOMM Computer
     Communication Review, 19(4), 1–12.
 
+-   eBPF.io. (2024). What is eBPF? https://ebpf.io/
+
+-   Eisenbud, D. E., Yi, C., Contavalli, C., Smith, C., Kononov, R.,
+    Mann-Hielscher, E., Cilingiroglu, A., Cheyney, B., Shang, W., &
+    Hosein, J. D. (2016). Maglev: A Fast and Reliable Software Network
+    Load Balancer. 13th USENIX Symposium on Networked Systems Design
+    and Implementation (NSDI 16).
+    https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud
+
+-   Fried, J., Ruan, Z., Ousterhout, A., & Belay, A. (2020). Caladan:
+    Mitigating Interference at Microsecond Timescales. 14th USENIX
+    Symposium on Operating Systems Design and Implementation (OSDI 20).
+    https://www.usenix.org/conference/osdi20/presentation/fried
+
+-   Garrett, O. (2015). Inside NGINX: How We Designed for Performance
+    & Scale. NGINX Blog.
+    https://blog.nginx.org/blog/inside-nginx-how-we-designed-for-performance-scale
+
 -   HAProxy Technologies. (2024). HAProxy: The reliable, high
     performance TCP/HTTP load balancer. https://www.haproxy.org/
 
--   Linux man-pages. (2023a). epoll(7) — Linux Programmer's Manual.
-    https://man7.org/linux/man-pages/man7/epoll.7.html
+-   Høiland-Jørgensen, T., Brouer, J. D., Borkmann, D., Fastabend, J.,
+    Herbert, T., Ahern, D., & Miller, D. (2018). The eXpress Data
+    Path: Fast Programmable Packet Processing in the Operating System
+    Kernel. Proceedings of the 14th International Conference on
+    emerging Networking EXperiments and Technologies (CoNEXT '18),
+    54–66. https://doi.org/10.1145/3281411.3281443
 
--   Linux man-pages. (2023b). SO_REUSEPORT socket option.
+-   Kaffes, K., Chong, T., Humphries, J. T., Belay, A., Mazières, D.,
+    & Kozyrakis, C. (2019). Shinjuku: Preemptive Scheduling for
+    µsecond-scale Tail Latency. 16th USENIX Symposium on Networked
+    Systems Design and Implementation (NSDI 19).
+    https://www.usenix.org/conference/nsdi19/presentation/kaffes
+
+-   Kerrisk, M. (2013). The SO_REUSEPORT socket option. LWN.net.
     https://lwn.net/Articles/542629/
 
--   Manekar, V., & Narayanan, A. (2018). Katran: A high performance
-    layer 4 load balancer. Meta Engineering Blog.
-    https://engineering.fb.com/2018/05/22/open-source/katran/
+-   Kogias, M., Iyer, R., & Bugnion, E. (2020). Bypassing the Load
+    Balancer Without Regrets. Proceedings of the 11th ACM Symposium on
+    Cloud Computing (SoCC '20).
+    https://marioskogias.github.io/docs/crab.pdf
+
+-   Linux man-pages. (2023). epoll(7) — Linux Programmer's Manual.
+    https://man7.org/linux/man-pages/man7/epoll.7.html
+
+-   Lu, Y., Xie, Q., Kliot, G., Geller, A., Larus, J. R., & Greenberg,
+    A. (2011). Join-Idle-Queue: A novel load balancing algorithm for
+    dynamically scalable web services. Performance Evaluation, 68(11),
+    1056–1071.
+
+-   Majkowski, M. (2017). Why does one NGINX worker take all the load?
+    Cloudflare Blog.
+    https://blog.cloudflare.com/the-sad-state-of-linux-socket-balancing/
+
+-   Matsakis, N. D., & Klock, F. S. (2014). The Rust Language.
+    Proceedings of the 2014 ACM SIGAda Annual Conference on High
+    Integrity Language Technology (HILT '14), 103–104.
+    https://doi.org/10.1145/2663171.2663188
+
+-   McCanne, S., & Jacobson, V. (1993). The BSD Packet Filter: A New
+    Architecture for User-level Packet Capture. Proceedings of the
+    USENIX Winter 1993 Conference, 259–270.
+    https://www.usenix.org/conference/usenix-winter-1993-conference/bsd-packet-filter-new-architecture-user-level-packet
+
+-   Mitzenmacher, M. (2001). The Power of Two Choices in Randomized
+    Load Balancing. IEEE Transactions on Parallel and Distributed
+    Systems, 12(10), 1094–1104.
 
 -   Molnar, I. (2007). Modular scheduler core and completely fair
     scheduler. Linux Kernel Mailing List.
     https://lwn.net/Articles/230501/
+
+-   NGINX. (2015). Socket Sharding in NGINX Release 1.9.1. NGINX Blog.
+    https://www.f5.com/company/blog/nginx/socket-sharding-nginx-release-1-9-1
+
+-   Olteanu, V., Agache, A., Voinescu, A., & Raiciu, C. (2018).
+    Stateless Datacenter Load-balancing with Beamer. 15th USENIX
+    Symposium on Networked Systems Design and Implementation
+    (NSDI 18), 125–139.
+    https://www.usenix.org/conference/nsdi18/presentation/olteanu
+
+-   Ousterhout, A., Fried, J., Behrens, J., Belay, A., & Balakrishnan,
+    H. (2019). Shenango: Achieving High CPU Efficiency for
+    Latency-sensitive Datacenter Workloads. 16th USENIX Symposium on
+    Networked Systems Design and Implementation (NSDI 19).
+    https://www.usenix.org/conference/nsdi19/presentation/ousterhout
 
 -   Pan, T., Song, E., Zuo, Y., Zhang, S., Song, Y., Zhao, J., Hou, W.,
     Lu, J., Sun, X., Zhang, S., Yang, Y., Zhang, J., Huang, T., Lyu, B.,
@@ -784,3 +1513,38 @@ References
     Layer-7 Cloud Load Balancers with Userspace-Directed I/O Event
     Notification. Proceedings of the ACM SIGCOMM 2025 Conference,
     363–380. https://doi.org/10.1145/3718958.3750469
+
+-   Patel, P., Bansal, D., Yuan, L., Murthy, A., Greenberg, A., Maltz,
+    D. A., Kern, R., Kumar, H., Zikos, M., Wu, H., Kim, C., & Karri,
+    N. (2013). Ananta: Cloud Scale Load Balancing. Proceedings of the
+    ACM SIGCOMM 2013 Conference.
+    https://doi.org/10.1145/2486001.2486026
+
+-   Prekas, G., Kogias, M., & Bugnion, E. (2017). ZygOS: Achieving Low
+    Tail Latency for Microsecond-scale Networked Tasks. Proceedings of
+    the 26th Symposium on Operating Systems Principles (SOSP '17).
+    https://doi.org/10.1145/3132747.3132780
+
+-   Shirokov, N., & Dasineni, R. (2018). Open-sourcing Katran, a
+    scalable network load balancer. Meta Engineering Blog.
+    https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/
+
+-   Vieira, M. A. M., Castanho, M. S., Pacífico, R. D. G., Santos,
+    E. R. S., Câmara Júnior, E. P. M., & Vieira, L. F. M. (2020). Fast
+    Packet Processing with eBPF and XDP: Concepts, Code, Challenges,
+    and Applications. ACM Computing Surveys, 53(1), 1–36.
+    https://doi.org/10.1145/3371038
+
+-   Wang, Y., Shou, C., Qian, J., & Liu, G. (2026). XLB: A High
+    Performance Layer-7 Load Balancer for Microservices using
+    eBPF-based In-kernel Interposition. arXiv preprint
+    arXiv:2602.09473. https://arxiv.org/abs/2602.09473
+
+-   Yang, R., & Kogias, M. (2023). HEELS: A Host-Enabled eBPF-Based
+    Load Balancing Scheme. Proceedings of the 1st Workshop on eBPF and
+    Kernel Extensions (eBPF '23).
+    https://doi.org/10.1145/3609021.3609307
+
+-   Zhang, W. (2000). Linux Virtual Server for Scalable Network
+    Services. Proceedings of the Ottawa Linux Symposium 2000.
+    http://www.linuxvirtualserver.org/ols/lvs.pdf

@@ -8,10 +8,10 @@ micro-hermes simulator.
 | Path | What it is |
 |---|---|
 | `run_benchmarks.sh` | Runs the full matrix: 3 policies × 5 cases × `TRIALS` trials (each trial gets a distinct `SEED`). Skips result files that already exist. |
-| `hermes_analysis.ipynb` | **The one thing to run.** Annotated notebook: generates data if missing, then produces all figures and tables. Every figure section includes a suggested caption and a design-justification paragraph written for direct adaptation into the dissertation. |
+| `hermes_analysis.ipynb` | **The one thing to run.** Annotated notebook: generates data if missing, then produces all figures and tables. Every figure section says what the plot shows, why it is included, and gives a caption ready to paste into the dissertation. |
 | `results/` | Raw per-run CSVs (`*_ticks.csv`, `*_conns.csv`). Git-ignored; regenerate any time. |
 | `figures/` | Output figures, PNG (300 dpi, drafts) + PDF (vector, for LaTeX). |
-| `tables/` | Output tables, CSV + LaTeX (`summary_stats.tex` is a ready `table` environment). |
+| `tables/` | Output tables, CSV + LaTeX. `summary_stats` is the single main table covering all five cases (Case 5's rows are the burst follow-up requests); `validation_verdicts` is the pass/fail check against the paper's expected orderings. |
 
 ## Usage
 

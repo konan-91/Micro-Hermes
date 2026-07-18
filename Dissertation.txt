@@ -366,7 +366,8 @@ The mechanisms sit atop the kernel's I/O event notification facility.
 Early Unix multiplexing primitives — select and poll — scan the full
 descriptor set on every call and scale poorly to the tens of thousands
 of sockets a load balancer holds; BSD's kqueue (Lemon, 2001) and
-Linux's epoll replaced them with stateful interfaces whose cost tracks
+Linux's epoll (Linux man-pages, 2023) replaced them with stateful
+interfaces whose cost tracks
 the number of *ready* descriptors rather than the number monitored,
 which is why epoll underpins essentially every high-performance Linux
 network server today.
@@ -976,9 +977,12 @@ feedback loop from worker status to dispatch decision is closed.]
 
 7.2 Worker Status Table
 
-The WST follows the layout described by Pan et al. (2025): one slot per
-worker holding the three status metrics, each stored as an individually
-atomic 64-bit integer. The metrics are the timestamp of the most recent
+The WST holds, per worker, the three status metrics of Pan et al.
+(2025), each stored as an individually atomic 64-bit integer. The
+paper draws the table as one row per metric spanning all workers; this
+implementation transposes that layout into one slot per worker, which
+changes nothing about who reads or writes which field.
+The metrics are the timestamp of the most recent
 event-loop entry (used for hang detection), the count of pending events
 (events delivered by epoll_wait but not yet handled, a proxy for
 instantaneous processing load), and the accumulated count of open
@@ -1184,7 +1188,8 @@ and heavy — by scaling the case's connection arrival rate while
 holding its cost distribution fixed. Utilisation (offered load divided
 by the four workers' aggregate service capacity) spans roughly 10% to
 75% for Case 1, 45% to 112% for Case 2 (its heavy level is a sustained
-overload, and carries the injected stall), and 28% to 93% for Case 4;
+overload; the 400 ms stall is part of the case's profile and is
+injected at every level), and 28% to 93% for Case 4;
 Case 3's cost is trivial, so its levels instead scale how many
 long-lived connections accumulate (120, 240 and 600 per run). The
 detailed per-case analysis in Section 9.2 uses each case's
@@ -1238,8 +1243,8 @@ busy or stalled workers — while Micro-Hermes routes around them.]
 [FIGURE 3 HERE — analysis/figures/fig2_p99_bars.pdf
 Caption: 99th-percentile connection latency per policy (bars: mean of
 per-trial p99; error bars: min–max across trials; note the independent
-y-scales). Under load, reuseport's p99 is roughly double
-Micro-Hermes's (Cases 2 and 4). The LIFO model's low latency in those
+y-scales). Under load, reuseport's p99 exceeds Micro-Hermes's — by
+roughly 30% in Case 2 and 2.2x in Case 4. The LIFO model's low latency in those
 cases is a simulation boundary discussed in Section 9.5, and Figure 8
 shows the liability that accompanies it.]
 
@@ -1378,7 +1383,7 @@ the paper's three metrics (mean latency, P99, throughput).
 [TABLE 2 HERE — analysis/tables/load_sweep.tex
 Caption: The Table-3-style load sweep: mean latency, P99 and
 throughput per policy at light/medium/heavy offered load in each case
-(mean over 3 trials). Case 2's heavy level carries the injected
+(mean over 3 trials). Every Case 2 level carries the injected
 stall.]
 
 The sweep confirms that the rankings above are not artefacts of one
@@ -1416,8 +1421,9 @@ Case 2 injects a 400 ms stall into one worker mid-run, reproducing the
 kind of hang that motivated the original Hermes paper. The recorded
 scheduler decisions show the mechanism working as intended: in every
 trial, the stalled worker is removed from the candidate bitmap within
-300-400 ms of the stall starting, and readmitted shortly after it
-ends. Figure 6 traces one such episode end to end.
+the 200 ms hang threshold of the stall starting (56-192 ms across
+trials), and readmitted within milliseconds of re-entering its loop.
+Figure 6 traces one such episode end to end.
 
 [FIGURE 6 HERE — analysis/figures/fig5_hang_detection.pdf
 Caption: Hang detection during a Case 2 run with a 400 ms stall
@@ -1457,15 +1463,17 @@ load (Cases 1 and 3), the filters barely prune anything: on average
 Caption: Mean number of workers surviving each stage of the
 scheduler's cascading filter, per case (Hermes runs; error bars: ±1 sd
 across trials). Light-load cases prune almost nothing; the overloaded
-Case 2 prunes hardest, and is the only case where the hang filter
-(Stage 1) removes workers — the injected stall, plus workers stuck in
-long processing batches that are indistinguishable from hangs.]
+Case 2 prunes hardest, and only the high-cost cases (2 and 4) see the
+hang filter (Stage 1) remove workers — the injected stall, plus workers
+stuck in long processing batches that are indistinguishable from
+hangs.]
 
 Under heavier load, the candidate set shrinks. This is most visible in
 the overloaded Case 2, where the mean surviving set falls to 2.6 of 4
 workers after the third filter, and the event count filter does most
-of that pruning. Case 2 is also the only case where the time filter
-itself prunes appreciably (a mean of 3.5 survivors after stage one).
+of that pruning. Case 2 is also where the time filter itself prunes
+hardest (a mean of 3.5 survivors after stage one, against 3.7 in the
+other high-cost case, Case 4, and none at all in the light-load cases).
 This is not just the injected stall: a worker that spends several
 hundred milliseconds inside a single loop iteration processing a batch
 of slow events looks, from the WST's point of view, exactly like a
@@ -1528,7 +1536,7 @@ of ports being listened on - the simulation only ever uses one port,
 whereas a production load balancer listens on tens of thousands. On
 top of that, there is a real cost to waking a thread at all, and a
 problem of cache unfriendliness which was serious enough that Linux's
-maintainers refused to merged a round-robin fix meant to address
+maintainers refused to merge a round-robin fix meant to address
 exclusive's imbalance. None of these costs apply to the simulation.
 
 Both factors point the same way: they make simulated exclusive look

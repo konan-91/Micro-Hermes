@@ -117,7 +117,7 @@ Table of Contents
 
 8.4 Engineering Challenges
 
-9. Evaluation
+9. Evaluation and Critical Appraisal
 
 9.1 Evaluation Framework and Methodology
 
@@ -129,7 +129,7 @@ Table of Contents
 
 9.5 Discussion
 
-10. Conclusion
+10. Conclusions
 
 10.1 Summary of Contributions
 
@@ -319,7 +319,8 @@ Layer 7 (L7) balancer, by contrast, terminates the connection and
 operates on application content: it performs the TLS handshake, parses
 HTTP, routes on headers or paths, compresses responses, and translates
 between protocol versions (HAProxy Technologies, 2024). Widely deployed
-examples include HAProxy, NGINX and Envoy. (!! ref?)
+examples include HAProxy, NGINX and Envoy (HAProxy Technologies, 2024;
+Garrett, 2015; Envoy Proxy Authors, 2024).
 
 Two consequences of L7 matter here. First, per-connection cost
 is highly variable and unknowable in advance: one connection may need a
@@ -882,11 +883,16 @@ hang threshold constant), the choice was recorded as
 implementation-defined.
 
 Because the requirements were fixed up front, the macro-process was
-plan-driven: the two-phase structure (userspace simulation first, eBPF
-port second) and the kernel/userspace component split were decided
-before any code was written, specifically so that Phase 2 would replace
-components rather than restructure the system. Within that frame,
-implementation proceeded iteratively in vertical slices: shared-memory
+plan-driven, in the waterfall sense: the two-phase structure (userspace
+simulation first, eBPF port second) and the kernel/userspace component
+split were decided before any code was written, specifically so that
+Phase 2 would replace components rather than restructure the system. A
+strict waterfall process was not, however, applied within each phase,
+since a fixed external specification does not remove the usual risk of
+discovering implementation-level surprises only once code is written
+(Section 8.4 records three such surprises). Within that frame,
+implementation instead proceeded iteratively, in an agile-influenced
+style, in vertical slices: shared-memory
 region first, then the WST, the scheduler, the dispatcher, the worker
 loop, the workload generator, and finally the benchmark harness — each
 slice accompanied by unit tests before moving on. The test suite
@@ -900,10 +906,10 @@ Verification of the whole system, as opposed to its parts, was
 benchmark-driven: the paper's qualitative rankings per traffic regime
 were written down as explicit validation targets before the benchmarks
 were run, and the analysis pipeline checks them mechanically and prints
-pass/fail verdicts (Section 9.1). Version control (git) was used
-throughout, with the analysis notebook, benchmark scripts and results
-kept in-repository so that the entire evaluation is reproducible from a
-clean checkout. Deviations discovered during development — the metrics
+pass/fail verdicts (Section 9.1). Version control (git, hosted on GitHub) was
+used throughout, with the analysis notebook, benchmark scripts and
+results kept in-repository so that the entire evaluation is
+reproducible from a clean checkout. Deviations discovered during development — the metrics
 plumbing across fork(), the phase-locked timer artefact in the LIFO
 baseline, the batch-size compensation — were treated as first-class
 engineering records and are reported in Section 8.4 rather than
@@ -1169,7 +1175,7 @@ hang-detection threshold and starve the scheduler of fresh status
 data. The batch limit is therefore kept small (4 events), preserving
 the paper's property that scheduler frequency scales with load.
 
-9. Evaluation
+9. Evaluation and Critical Appraisal
 
 9.1 Evaluation Framework and Methodology
 
@@ -1596,7 +1602,7 @@ occasions its candidate set shrinks to one worker or none, and,
 uniquely among the three mechanisms tested, stays competitive in every
 traffic regime.
 
-10. Conclusion
+10. Conclusions
 
 10.1 Summary of Contributions
 
@@ -1704,6 +1710,26 @@ Correctness was established at three levels: unit tests over the
 algorithmic components, mechanical validation of whole-system
 behaviour against the paper's predictions, and integrity checks in the
 analysis pipeline.
+
+Traceability to requirements. Each level of testing was chosen to close
+off a specific requirement from Chapter 4, rather than testing being an
+undirected activity performed after the fact. FR1 (the WST) and FR2/FR3
+(Algorithms 1 and 2) are the requirements with the most precise
+published specification, so they receive direct unit tests: a test
+exists for each clause of each algorithm's definition, described below.
+FR4 (the instrumented event loop), FR5 (the baselines) and FR6 (the
+workload generator) are harder to test in isolation, since their
+correctness is behavioural rather than a fixed input/output mapping;
+these are instead verified through the whole-system predicates, which
+encode the paper's per-regime expectations and would fail if the loop,
+a baseline, or the generator misbehaved. FR7 (metrics recording) is
+verified by the analysis pipeline's data-integrity checks. NFR1
+(lock-free concurrency) is exercised directly by the SPSC ring test's
+wrap-around and overflow cases. This mapping is what "the testing
+verifies the requirements" means in this project: every must-have
+requirement in Chapter 4 is the deliberate target of a named test or
+predicate below, not an incidental side effect of testing the code that
+happened to get written.
 
 Unit tests (17 tests, run with cargo test) cover the components whose
 correctness the evaluation depends on:
@@ -1844,6 +1870,9 @@ References
     Communication Review, 19(4), 1–12.
 
 -   eBPF.io. (2024). What is eBPF? https://ebpf.io/
+
+-   Envoy Proxy Authors. (2024). Envoy: An open source edge and service
+    proxy. https://www.envoyproxy.io/
 
 -   Eisenbud, D. E., Yi, C., Contavalli, C., Smith, C., Kononov, R.,
     Mann-Hielscher, E., Cilingiroglu, A., Cheyney, B., Shang, W., &

@@ -1,6 +1,7 @@
 # --- Rust/Cargo ---
-# Block the entire target directory where compilation happens
-/target/
+# Block every target directory where compilation happens (workspace root
+# and phase1/, which is its own standalone crate)
+target/
 
 # Block Cargo's local lockfile adjustments or overrides if editing directly
 # (Note: Keep Cargo.lock! It should be committed for applications/binaries)

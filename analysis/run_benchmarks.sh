@@ -22,14 +22,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+PHASE1_DIR="$REPO_ROOT/phase1"
 RESULTS_DIR="$SCRIPT_DIR/results"
 TRIALS="${TRIALS:-3}"
 
 mkdir -p "$RESULTS_DIR"
 
 echo "[bench] building release binary..."
-cargo build --release --quiet --manifest-path "$REPO_ROOT/Cargo.toml"
-BIN="$REPO_ROOT/target/release/micro-hermes"
+cargo build --release --quiet --manifest-path "$PHASE1_DIR/Cargo.toml"
+BIN="$PHASE1_DIR/target/release/micro-hermes"
 
 total=0
 skipped=0

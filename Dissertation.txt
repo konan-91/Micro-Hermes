@@ -1,36 +1,40 @@
-Micro-Hermes: An Open-Source Implementation of eBPF Load Balancing
+Micro-Hermes: A Userspace Simulation Toward an Open-Source eBPF Layer-7 Load Balancer
 
 CS5099 Dissertation Draft
 
 Student: 250014506
+
+University of St Andrews
+[insert degree programme title]
+[insert date of submission]
 
 Abstract
 
 Layer 7 load balancers dispatch incoming TCP connections from the kernel
 to userspace worker processes, but the two mechanisms Linux provides for
 this — epoll's exclusive wakeup and SO_REUSEPORT's stateless hash — are
-blind to how busy each worker actually is. Because the cost of Layer 7
+blind to how busy each worker is. Because the cost of Layer 7
 work (TLS handshakes, compression, protocol translation) varies wildly
 between connections, this blindness concentrates load on a few workers,
 inflates tail latency, and keeps routing traffic to hung workers. Hermes
-(Pan et al., 2025), a production system at Alibaba Cloud, solves this by
-feeding live worker status back into the kernel through eBPF, letting an
-in-kernel program steer each new connection towards workers that
-userspace has marked as available. Hermes is closed-source. This
-dissertation presents Micro-Hermes, an open-source Rust implementation
-of the Hermes architecture, built in two phases: a complete userspace
-simulation of the three-stage feedback loop (this work), designed so
-that a subsequent phase can swap the simulated kernel components for a
-real eBPF program. The simulation uses real forked processes, shared
-memory, and lock-free atomics, and is evaluated against models of both
-standard Linux mechanisms across the paper's four traffic regimes plus a
-novel synchronised-burst scenario. The results reproduce the paper's
-central qualitative claim: neither standard mechanism is safe in every
-regime, while the Hermes design detects and routes around hung workers
-within a bounded window, balances long-lived connections an order of
-magnitude more evenly than exclusive wakeups, and remains competitive
-everywhere. Deviations from the paper's rankings are traced to
-documented boundaries of a userspace simulation.
+(Pan et al., 2025), a production system at Alibaba Cloud, closes this
+gap: workers publish live status into shared memory, and an in-kernel
+eBPF program steers each new connection towards workers marked
+available. Hermes is closed-source. This dissertation presents
+Micro-Hermes, an open-source Rust implementation of Hermes, built in two
+phases: a complete userspace simulation of the three-stage feedback loop
+(this work), designed so a later phase can swap the simulated kernel
+components for a real eBPF program. The simulation uses real forked
+processes, shared memory, and lock-free atomics, and is evaluated
+against models of both standard Linux mechanisms across the paper's
+four traffic regimes plus a novel synchronised-burst scenario. The
+results reproduce the paper's central qualitative claim: neither
+standard mechanism is safe in every regime, while Hermes detects and
+routes around hung workers within a bounded window, balances
+long-lived connections an order of magnitude more evenly than exclusive
+wakeups, and remains competitive everywhere. Deviations from the
+paper's rankings are traced to documented boundaries of a userspace
+simulation.
 
 Declaration
 
@@ -160,21 +164,21 @@ Operational experience at Alibaba Cloud shows how badly this can go
 wrong. Pan et al. (2025) report a production incident in which a single
 worker, stuck in a read loop by a slow downstream, dragged request
 latency from 30 milliseconds to 440 seconds for every connection pinned
-to it, while the kernel — unaware the worker was hung — continued to
+to it, while the kernel unaware the worker was hung, continued to
 assign it new connections. The root cause is architectural: the two
 mechanisms Linux offers for distributing connections across workers make
 their choice using either the wakeup order of a kernel wait queue or a
 stateless hash, and neither consults the one thing that predicts whether
-a worker can absorb more work: its actual runtime status in userspace.
+a worker can take on more work: its actual runtime status in userspace.
 
-Hermes, the system Alibaba built in response, closes this gap with a
-feedback loop: workers publish their live status into shared memory, a
+Hermes, the system Alibaba built in response, fixes this with a
+feedback loop: workers write their live status into shared memory, a
 lightweight userspace scheduler distils that status into a set of
-candidate workers, and an eBPF program inside the kernel steers each new
+candidate workers, and an eBPF program inside the kernel forwards each new
 connection to one of the candidates. In production it reduced daily
 worker hangs by 99.8% and infrastructure unit cost by 18.9% (Pan et al.,
 2025). But Hermes is closed-source and embedded in a proprietary
-hyperscale stack. Its architecture is published; its code, and therefore
+hyperscale system. Its architecture is published, but its code, and therefore
 any independent validation of its claims, is not. This project exists to
 change that: to implement the Hermes architecture in the open, in Rust,
 and test whether its published behaviour can be reproduced outside
@@ -186,13 +190,13 @@ The problem this dissertation addresses is twofold.
 
 First, the technical problem inherited from Hermes: kernel connection
 dispatch is blind to userspace load. epoll's exclusive wakeup mode
-prefers the most recently registered worker, concentrating connections
-onto a few workers; SO_REUSEPORT's hash spreads connections evenly on
-average but keeps dispatching to workers that are overloaded, hung, or
+prefers the most recently registered worker, which concentrates connections
+onto a few workers. SO_REUSEPORT's hash spreads connections evenly on
+average but keeps blindly dispatching to workers that are overloaded, hung, or
 crashed. L7 processing cost varies by orders of magnitude between
 connections and is unknowable at dispatch time, so per-worker load
 diverges even under a perfectly uniform hash. Only userspace knows how
-loaded a worker really is; only the kernel decides where connections go.
+loaded a worker really is, and only the kernel decides where connections go.
 A correct solution must carry information across that boundary cheaply
 and safely.
 
@@ -202,16 +206,16 @@ independently reproduced, its architecture cannot be studied or extended
 by others, and organisations without Alibaba's infrastructure cannot
 adopt it. Can the Hermes architecture be reimplemented faithfully from
 its published description, and does the reimplementation reproduce the
-qualitative behaviour the paper claims — in particular its adaptability
-across traffic regimes and its bounded-time detection of hung workers?
+qualitative behaviour the paper claims, like its adaptability
+across traffic regimes and its time bounded detection of hung workers?
 
 1.3 Aims and Objectives
 
 The aim of the project is a faithful, open-source implementation of the
 Hermes architecture, developed in two phases: Phase 1 (this
 dissertation) implements and evaluates the complete three-stage feedback
-loop as a userspace simulation, with the kernel-resident pieces replaced
-by stand-ins that preserve their interfaces; Phase 2 (future work)
+loop as a userspace simulation, with the kernel pieces replaced
+by userspace stand-ins; Phase 2 (future work)
 replaces those stand-ins with a real eBPF program. The objectives, in
 order of importance:
 
@@ -268,16 +272,16 @@ building and reproducing every result, and the ethics self-assessment.
 
 2.1 A Brief History of Load Balancing
 
-Load balancing — distributing incoming work across a pool of servers so
-that no one server becomes a bottleneck — is nearly as old as the web
+Load balancing, distributing incoming work across a pool of servers so
+that no one server becomes a bottleneck, is nearly as old as the web
 itself. The earliest widely deployed mechanism was round-robin DNS,
 standardised in the mid-1990s, in which a name server hands out a
 rotating list of addresses for the same hostname (Brisco, 1995). DNS
 balancing is coarse: it cannot see server load, cannot react to
 failures faster than caches expire, and offers no per-connection
 control. Through the late 1990s and 2000s the industry answer was the
-dedicated hardware appliance — a middlebox terminating traffic for a
-virtual IP and spreading it across backends — alongside early
+dedicated hardware appliance, a middlebox terminating traffic for a
+virtual IP and spreading it across backends, alongside early
 software alternatives in the operating system kernel, most notably the
 Linux Virtual Server project, which added transport-layer (Layer 4)
 load balancing directly into Linux (Zhang, 2000).
@@ -299,9 +303,9 @@ All of these systems answer the question "which machine should serve
 this connection?". This dissertation is concerned with the question one
 level down, which arises after the machine has been chosen: which
 worker process on that machine should serve it? The same imbalance
-problem recurs there in miniature — uneven work sizes, stateless
-assignment, workers that hang — but the mechanisms available are
-different, because the "scheduler" is the operating system kernel and
+problem recurs here; uneven work sizes, stateless
+assignment, workers that hang. However, the mechanisms available are
+different as the "scheduler" is the operating system kernel and
 the "servers" are processes sharing its cores.
 
 2.2 The Layer 4 vs Layer 7 Distinction
@@ -315,16 +319,16 @@ Layer 7 (L7) balancer, by contrast, terminates the connection and
 operates on application content: it performs the TLS handshake, parses
 HTTP, routes on headers or paths, compresses responses, and translates
 between protocol versions (HAProxy Technologies, 2024). Widely deployed
-examples include HAProxy, NGINX and Envoy.
+examples include HAProxy, NGINX and Envoy. (!! ref?)
 
-Two consequences of the L7 role matter here. First, per-connection cost
+Two consequences of L7 matter here. First, per-connection cost
 is highly variable and unknowable in advance: one connection may need a
-full TLS handshake plus regex routing while its neighbour is a cheap
+full TLS handshake plus regex routing while its neighbour is a simple
 keep-alive request, and which is which only becomes apparent during
 processing. Queue depth, the classic L4 load signal, is therefore a
 poor proxy for L7 load. Second, the standard L7 server architecture is
 a set of worker processes, one pinned to each CPU core, each running a
-run-to-completion event loop over epoll; NGINX popularised this design
+run-to-completion event loop over epoll. NGINX popularised this design
 and documents it in detail (Garrett, 2015). Connections are pinned to
 the worker that accepts them for their entire lifetime — migrating
 established connections across workers is not practical, since the
@@ -567,10 +571,13 @@ The problem of distributing work across CPU cores has a long history in
 operating systems research. Classical CPU schedulers, such as the
 Completely Fair Scheduler (CFS) in Linux, aim to divide processing time
 equitably among threads based on runtime metrics (Molnar, 2007). These
-schedulers operate at the process level and are well-studied; however,
-they are not designed to account for the nature of individual network
-connections or the imbalance that can arise when some requests are
-significantly heavier than others.
+schedulers, which operate at the process level, are well studied, but
+they equalise CPU time rather than request cost: they have no mechanism
+to account for the nature of individual network connections, or for the
+imbalance that arises when some requests are significantly heavier than
+others — a request requiring a TLS handshake or on-the-fly compression
+is far more CPU-intensive, and far more variable in cost, than a
+typical connection on the same server.
 
 Network scheduling has similarly been studied in the context of packet
 queuing and traffic shaping, with disciplines like weighted fair queuing

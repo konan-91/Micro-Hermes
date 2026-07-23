@@ -22,8 +22,16 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$SCRIPT_DIR/results"
 TRIALS="${TRIALS:-3}"
 
-echo "[bench] priming sudo credential cache (needed for every 'hermes' start)"
-sudo -v
+# Prime sudo's credential cache so the matrix doesn't prompt per-point. This
+# is a best-effort latency optimisation only: `sudo -v` needs a controlling
+# terminal, which it doesn't have when this script runs non-interactively
+# (e.g. backgrounded, or under sudo-rs on Ubuntu where `-v` is terminal-only).
+# In those setups a passwordless sudoers rule for the `hermes` binary is what
+# actually authorises each start, so a failure here is non-fatal — the real
+# `sudo -E ... hermes` calls in run_case.sh still succeed. Don't let it trip
+# `set -e`.
+echo "[bench] priming sudo credential cache (best-effort; needed for every 'hermes' start)"
+sudo -v 2>/dev/null || echo "[bench] sudo -v unavailable (non-interactive / sudo-rs); relying on NOPASSWD sudoers rule"
 
 echo "[bench] building release binaries..."
 cargo build --release --quiet --manifest-path "$REPO_ROOT/Cargo.toml" -p hermes -p hermes-bench

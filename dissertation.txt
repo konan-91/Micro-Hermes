@@ -342,105 +342,85 @@ the "servers" are processes sharing its cores.
 
 2.2 The Layer 4 vs Layer 7 Distinction
 
-Load balancers are conventionally divided by the network layer at which
+Load balancers are conventionally organised by the network layer at which
 they operate. A Layer 4 (L4) balancer forwards packets: it selects a
-backend using the connection's addressing 5-tuple, rewrites or
-encapsulates headers, and never inspects payload. Its per-connection
-cost is small and roughly uniform, proportional to packet count. A
-Layer 7 (L7) balancer, by contrast, terminates the connection and
-operates on application content: it performs the TLS handshake, parses
+backend using the connection's 5-tuple, rewrites or encapsulates headers,
+and never inspects the payload. The quantity of work it has to do for a
+given connection is small, and it scales directly with how many packets
+a given connection sends as each packet is cheap and requires roughly
+the same amount of processing. Layer 7 (L7) balancer, by contrast, terminates the connection and
+operates on application content: it performs TLS handshakes, parses
 HTTP, routes on headers or paths, compresses responses, and translates
 between protocol versions (HAProxy Technologies, 2024). Widely deployed
 examples include HAProxy, NGINX and Envoy (HAProxy Technologies, 2024;
 Garrett, 2015; Envoy Proxy Authors, 2024).
 
-Two consequences of L7 matter here. First, per-connection cost
-is highly variable and unknowable in advance: one connection may need a
+There are two important consequences of operating at L7. First, per-connection cost
+is highly variable and unknowable in advance. One connection may need a
 full TLS handshake plus regex routing while its neighbour is a simple
-keep-alive request, and which is which only becomes apparent during
-processing. Queue depth, the classic L4 load signal, is therefore a
-poor proxy for L7 load. Second, the standard L7 server architecture is
+keep-alive request; which is which only becomes apparent during
+processing. Therefore, using a classic L4 load metric like queue depth
+is a poor proxy for L7 load. Second, the standard L7 architecture is
 a set of worker processes, one pinned to each CPU core, each running a
 run-to-completion event loop over epoll. NGINX popularised this design
-and documents it in detail (Garrett, 2015). Connections are pinned to
-the worker that accepts them for their entire lifetime — migrating
-established connections across workers is not practical, since the
+and documents it in detail (Garrett, 2015). Migrating
+established connections across workers is not practical since the
 connection's protocol state (TLS session, parser state, buffers) lives
-in that worker's memory. Every dispatch decision is therefore
-permanent, which is what makes the dispatch mechanism worth engineering
-carefully.
+in that worker's memory, and therefore connections are pinned to the worker
+that accepts them across their entire lifetime. Every dispatch decision is therefore
+permanent, which makes the dispatch mechanism extremely important.
 
-A third consequence follows from multi-tenancy, and it is the setting
+A third consequence follows from multi-tenancy and is the setting
 Hermes was built for. A cloud L7 load balancer serves many tenants from
-the same worker pool, and Alibaba's architecture isolates them by
+the same worker pool. Alibaba's architecture isolates them by
 port: before traffic reaches the L7 LB, the layer below rewrites each
-tenant's port-80/443 traffic to a distinct destination port, and the
+tenant's port 80/443 traffic to a distinct destination port, and the
 L7 LB binds a separate listening socket to each port (Pan et al.,
-2025). This gives per-tenant traffic management (rate limiting,
-accounting) at port granularity, but it also means ports vastly
-outnumber workers — on the order of ten thousand ports against tens of
-workers — so every worker necessarily serves traffic from a large
-number of tenants at once. That raises the stakes of the dispatch
-decision: when one worker is overloaded, the latency penalty is not
+2025). This allows for per-tenant traffic management (rate limiting,
+accounting), but it also means ports vastly
+outnumber workers on the order of ten thousand ports against tens of
+workers, so every worker necessarily serves traffic from a large
+number of tenants at once. This makes the dispatch decision even more
+crucial as when one worker is overloaded, the latency penalty is not
 confined to one misbehaving tenant but shared by every tenant whose
-connections happen to be pinned there. Inter-worker load balancing is
-therefore not only a performance concern but the mechanism by which a
-multi-tenant load balancer preserves performance isolation between
-tenants. The port-per-tenant design also matters mechanically for the
-comparison in this dissertation: with epoll's shared-socket pattern,
+connections share the same worker. Inter-worker load balancing therefore
+does more than affect performance: it is what keeps tenants sharing a
+worker pool from degrading each other's performance. This 
+design also matters mechanically for the
+comparison in this dissertation: with epoll's shared socket pattern,
 every worker registers interest in every port, so kernel-side wakeup
-work grows with the number of ports — a cost that will resurface in
-the evaluation (Section 9.5).
+work grows with the number of ports (a cost that will resurface in
+the evaluation) (Section 9.5).
 
 2.3 Connection Scheduling Inside a Single Server
 
 When multiple workers listen for the same incoming connections, the
 kernel must decide which worker accepts each one. Linux provides two
-production mechanisms, and both were designed for correctness and
+mechanisms for this, and both were designed for correctness and
 throughput rather than balance.
 
-The mechanisms sit atop the kernel's I/O event notification facility.
-Early Unix multiplexing primitives — select and poll — scan the full
-descriptor set on every call and scale poorly to the tens of thousands
-of sockets a load balancer holds; BSD's kqueue (Lemon, 2001) and
-Linux's epoll (Linux man-pages, 2023) replaced them with stateful
-interfaces whose cost tracks
-the number of *ready* descriptors rather than the number monitored,
-which is why epoll underpins essentially every high-performance Linux
-network server today.
+These mechanisms sit on top of a lower-level kernel facility for tracking
+which connections have data ready. Early Unix versions of this facility,
+select and poll, scan every watched connection on every call, which scales
+poorly once a load balancer is holding tens of thousands of them open.
+BSD's kqueue (Lemon, 2001) and Linux's epoll (Linux man-pages, 2023) replaced
+this with a stateful interface that reports only the connections that are
+actually ready, so its cost tracks how many are ready rather than how many
+are being watched, which is why epoll underpins almost every
+high performance Linux network server today
 
-The older dispatch pattern gives all workers one shared listening
-socket and has each register it with epoll. Historically, a new
-connection woke every waiting worker — the "thundering herd" — of
-which all but one found nothing to accept. The classic userspace
-workaround, still available in NGINX as accept_mutex, serialises
-accept-side polling behind an application-level lock so only one
-worker listens at a time (NGINX, 2024) — avoiding the herd at the cost
-of putting a lock on the accept path. Linux 4.5 addressed the problem
-in the kernel instead, adding the EPOLLEXCLUSIVE flag so that only
-one waiter is woken per event (Baron, 2015a; Corbet, 2015). The
-implementation detail that matters for this dissertation is *which*
-worker gets woken: workers are inserted at the head of the socket's
-wait queue when they register, the queue is traversed from the head on
-each wakeup, and traversal stops at the first idle worker. The net
-effect is LIFO selection — the most recently registered (and, in steady
-state, most recently active) worker is preferred, so connections
-concentrate on a few workers while others starve. Cloudflare measured
-exactly this in production NGINX: one worker absorbing the bulk of new
-connections while the last worker received almost none (Majkowski,
-2017). A patch adding a round-robin wakeup mode (EPOLLROUNDROBIN) was
-proposed alongside EPOLLEXCLUSIVE to fix the imbalance, but was never
-merged into the mainline kernel, in part because rotating the wait
-queue is cache-unfriendly (Baron, 2015b; Corbet, 2015).
+The older dispatch pattern gives all workers one shared listening socket and has each one register it with epoll. Historically, a new connection would wake every worker waiting on that socket (the "thundering herd"), and all but one of them would wake up only to find nothing left to accept. The classic userspace workaround, still available in NGINX as accept_mutex, avoids this by putting a lock around the accept step so that only one worker is allowed to poll for new connections at a time (NGINX, 2024). This gets rid of the herd, but at the cost of introducing a lock into the accept path. Linux 4.5 addressed the same problem directly in the kernel instead, adding the EPOLLEXCLUSIVE flag so that only one waiting worker is woken per event, rather than all of them (Baron, 2015a; Corbet, 2015).
+
+What matters for this dissertation is which worker gets woken. When a worker registers with epoll, it is inserted at the head of that socket's wait queue. On each wakeup, the queue is traversed starting from the head, and traversal stops as soon as an idle worker is found. In practice this means selection is LIFO: the worker that registered most recently, which in steady state also tends to be whichever worker was most recently active, is the one preferred for new connections. The result is that connections concentrate on a small number of workers while the rest sit idle. Cloudflare observed exactly this behaviour in production NGINX, with one worker absorbing the bulk of new connections while the last worker in the queue received almost none (Majkowski, 2017). A patch adding a round robin wakeup mode, EPOLLROUNDROBIN, was proposed alongside EPOLLEXCLUSIVE specifically to fix this imbalance, but it was never merged into the mainline kernel, in part because rotating the wait queue on every wakeup is unfriendly to CPU caches (Baron, 2015b; Corbet, 2015).
 
 The newer pattern is SO_REUSEPORT, added in Linux 3.9, which lets each
-worker bind its own listening socket to the same port; the kernel then
-selects a socket — and hence a worker — per connection using a
+worker bind its own listening socket to the same port. The kernel then
+selects a socket/worker per connection using a
 stateless hash of the connection's 4-tuple (Kerrisk, 2013). Each worker
 gets a private accept queue, removing the shared-queue contention and
-the thundering herd entirely; NGINX's adoption of it ("socket
-sharding") measured 2–3x higher connection throughput (NGINX, 2015).
-The hash spreads connections evenly *in expectation*, but it is blind:
+the thundering herd entirely. NGINX's adoption of it ("socket
+sharding") measured 2-3x higher connection throughput (NGINX, 2015).
+The hash spreads connections evenly in expectation, but it is blind:
 it does not know that one worker is stuck in a slow TLS handshake, or
 hung, or dead — it keeps hashing a fixed 1/N share of new connections
 to a worker regardless of the worker's state, and hash collisions under
@@ -453,71 +433,26 @@ unbiased but perfectly blind. Neither can incorporate what the worker
 itself knows — how many events it has pending, how many connections it
 holds, whether it is making progress at all.
 
-Nor is the problem an artefact of epoll that newer interfaces resolve.
-io_uring, Linux's next-generation asynchronous I/O framework (Linux
-man-pages, 2024), wakes waiters in its default interrupt mode in a
-fixed FIFO order — a different bias from epoll exclusive's LIFO, but
-equally blind to worker load, and so equally capable of uneven
-process load (Pan et al., 2025). The blindness is structural: any
-wakeup-order policy fixed at registration time, whatever its order,
-dispatches without consulting worker state. Getting that knowledge
-into the kernel's dispatch decision requires a mechanism for running
-user-supplied logic at the socket-selection moment, which is exactly
-what eBPF provides.
+The newer pattern is SO_REUSEPORT, added in Linux 3.9, which lets each worker bind its own listening socket to the same port instead of all workers sharing one socket. When a new connection arrives, the kernel picks which worker's socket receives it by hashing the connection's 4-tuple (source and destination IP and port), a fixed, stateless calculation that does not depend on anything about worker load (Kerrisk, 2013). Because each worker now has its own private accept queue rather than sharing one, the contention problem and the thundering herd problem from the older pattern disappear entirely. NGINX's adoption of this approach, which it calls socket sharding, measured 2-3x higher connection throughput (NGINX, 2015). The hash spreads connections evenly on average, but it has no awareness of worker state: it has no way of knowing that a particular worker is stuck in a slow TLS handshake, or hung, or has crashed, so it keeps sending that worker its fixed 1 in N share of new connections regardless of whether it is capable of handling them. It is also possible for the even spread to break down under heavy hitter traffic, since a hash collision can put a disproportionate number of high volume connections on the same worker.
+
+Altogether the two mechanisms fail in opposite ways. Exclusive wakeup is aware of load only in the crude sense of preferring whichever worker is not currently busy, but its LIFO bias means load still ends up concentrated on a few workers. Reuseport spreads load with no bias at all, but with no awareness of worker state either. Neither mechanism can take into account the thing that actually matters and that only the worker itself knows: how many events it currently has pending, how many connections it is holding, or whether it is making any progress at all.
+
+The problem is not something specific to epoll that a newer interface simply fixes. io_uring, Linux's next-generation asynchronous I/O framework (Linux man-pages, 2024), wakes waiting workers in its default interrupt mode in a fixed FIFO order, first worker registered is first worker woken. That is a different bias from epoll exclusive's LIFO order, but it is just as blind to worker load, and so it is just as capable of producing uneven load across workers (Pan et al., 2025). The underlying issue is structural, not a quirk of any one interface, so any policy that fixes the wakeup order at the point a worker registers, no matter what that order is, ends up dispatching connections without ever consulting the worker's actual state. Making worker state part of the kernel's dispatch decision requires a way to run custom, user-supplied logic at the exact moment a socket is selected, which is precisely what eBPF provides.
+
+
 
 2.4 eBPF and Kernel Programmability
 
-The Berkeley Packet Filter began as a small in-kernel virtual machine
-for running user-supplied packet filters safely at capture time
-(McCanne & Jacobson, 1993). Linux's extended BPF (eBPF) generalises the
-idea into a kernel-wide extension mechanism: programs written against a
-restricted instruction set are verified by a kernel-side static
-verifier — which proves memory safety and termination before the
-program is admitted — then JIT-compiled and attached to hook points
-throughout the kernel, from system-call tracing to network packet
-processing (Vieira et al., 2020; eBPF.io, 2024). Verified safety is
-what distinguishes eBPF from kernel modules: a buggy eBPF program is
-rejected at load time rather than crashing the kernel. The price is
-programmability: no unbounded loops, no heap allocation, bounded
-program size, and communication with userspace only through typed
-shared "maps" — key/value structures readable and writable from both
-sides.
+The Berkeley Packet Filter began as a small in-kernel virtual machine for running user-made packet filters safely at capture time (McCanne & Jacobson, 1993). Linux's extended BPF (eBPF) generalises this into a kernel-wide extension mechanism. Programs are written with a restricted instruction set, then checked by a static verifier built into the kernel, which proves the program is memory safe and guaranteed to terminate before it is allowed to run at all. Once verified, the program is compiled just in time and attached to one of many hook points throughout the kernel, ranging from system call tracing to network packet processing (Vieira et al., 2020; eBPF.io, 2024). This verified safety is what separates eBPF from kernel modules: a buggy eBPF program is simply rejected when it is loaded, rather than being able to crash the kernel. The trade off is reduced programmability: no unbounded loops, no heap allocation, a bounded program size, and communication with userspace only through typed shared "maps", key/value structures that both the kernel program and userspace code can read and write.
 
-In networking, eBPF programs attach at several layers. At the lowest,
-XDP runs programs in the network driver before the kernel stack ever
-sees the packet, enabling line-rate packet processing on commodity
-hardware (Høiland-Jørgensen et al., 2018). Higher up — and central to
-this project — the SO_ATTACH_REUSEPORT_EBPF socket option (Linux 4.5)
-attaches an eBPF program to a SO_REUSEPORT socket group, letting the
-program override the kernel's default hash and choose *which socket*
-receives each incoming connection via the bpf_sk_select_reuseport
-helper. This is the precise hook Hermes uses: it turns the reuseport
-group's socket selection, formerly a fixed hash, into a programmable
-decision that can consult state pushed down from userspace through an
-eBPF map.
+In networking, eBPF programs attach at several different layers. At the lowest layer, XDP runs programs directly in the network driver, before the kernel's own networking stack ever sees the packet, which enables line rate packet processing (handling packets as fast as the network link can deliver them) on ordinary hardware (Høiland-Jørgensen et al., 2018). Higher up the stack, and the layer central to this project, the SO_ATTACH_REUSEPORT_EBPF socket option (Linux 4.5) attaches an eBPF program to a group of sockets sharing a port through SO_REUSEPORT. This lets the program override the kernel's default hash based selection and instead choose which socket receives each incoming connection, using the bpf_sk_select_reuseport helper. This is the exact hook Hermes uses: it turns socket selection within a reuseport group from a fixed hash calculation into a programmable decision, one that can take into account state pushed down from userspace through an eBPF map.
 
-The hook is not exotic — it already carries production traffic at
-several major operators, which is evidence for its maturity. Meta uses
-it to migrate established listening sockets between old and new server
-processes during software releases, achieving connection-preserving
-restarts of a multi-billion-user service (Naseer et al., 2020). NGINX
-uses it to route QUIC packets sharing a connection ID to the same
-worker (NGINX, 2021). Cloudflare contributed a sibling hook, sk_lookup,
-that lets an eBPF program choose the receiving socket before the
-standard lookup runs at all, decoupling services from the IP/port they
-are addressed by (Fayed et al., 2021). What distinguishes Hermes from
-all of these is the *input* to the programmable decision: their
-steering logic is static or application-defined (a release phase, a
-QUIC connection ID, an addressing rule), whereas Hermes closes a
-feedback loop — the selection adapts continuously to measured worker
-runtime status.
+This hook is not an obscure or experimental feature, it already carries production traffic at several major operators, which is evidence of how mature it is. Meta uses it to migrate already established listening sockets from old server processes to new ones during software releases, allowing a multi billion user service to restart without dropping connections (Naseer et al., 2020). NGINX uses it to make sure QUIC packets that share a connection ID are routed to the same worker (NGINX, 2021). Cloudflare contributed a related hook, sk_lookup, which lets an eBPF program choose the receiving socket before the kernel's standard lookup process even runs, decoupling a service from the specific IP address and port it is normally addressed by (Fayed et al., 2021).
+What sets Hermes apart from all of these existing methods is that it closes a feedback loop, continuously adapting its socket selection based on the worker's runtime status rather than relying on a logic which is static or defined by the application itself like a release phase, a QUIC connection ID, an addressing rule.
 
-This project implements in Rust, targeting the Aya library for its
-eBPF phase. Rust's ownership-based type system provides memory safety
-without garbage collection, making it suited to systems code on both
-sides of the kernel boundary (Matsakis & Klock, 2014); Aya is a pure-
-Rust eBPF library that compiles eBPF programs and manages maps without
-depending on the C libbpf toolchain (Aya Contributors, 2024).
+This project is implemented in Rust, and will target the Aya library once it reaches the eBPF phase. Rust was chosen because its ownership based type system catches memory safety bugs (like use after free or data races) at compile time, without needing a garbage collector to manage memory at runtime. That combination makes it well suited to systems level code on both sides of the kernel boundary, the userspace workers and, later, the eBPF programs themselves (Matsakis & Klock, 2014). Aya is a library written entirely in Rust that compiles eBPF programs and manages their maps directly, without depending on libbpf, the standard C based toolchain most eBPF projects use (Aya Contributors, 2024).
+
+
 
 2.5 The Hermes Architecture
 

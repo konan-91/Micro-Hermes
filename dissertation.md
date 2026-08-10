@@ -320,13 +320,9 @@ Because the dispatcher was written from the start under the restrictions the ker
 
 In both versions the feedback loop is closed: a worker's load comes entirely from the connections the dispatcher assigned to it, and the dispatcher's decisions are driven by the bitmap the workers' schedulers publish, which is exactly the interaction the evaluation tests. Figure 1 shows both layouts side by side.
 
-[FIGURE 1 HERE: side-by-side architecture diagram, one panel per version, shared parts aligned and shaded identically to show they are the same code.
+[FIGURE 1 HERE: side-by-side architecture diagram, one panel per version, shared parts shaded identically. Left, the simulation: parent process (generator → dispatcher → per-worker queues) above 4 forked workers; shared-memory strip carrying the WST, M_Sel and queues. Right, the eBPF version: load generator sending real TCP connections into a kernel box containing the eBPF program; below, 4 workers, each with its own listening socket; shared-memory strip carrying the WST.
 
-LEFT PANEL, "simulation": parent process (generator → dispatcher → per-worker queues); below, 4 forked workers running the instrumented event loop with the scheduler (Algorithm 1) at loop end writing the bitmap to M_Sel; shared-memory strip carrying the WST, M_Sel, and queues.
-
-RIGHT PANEL, "eBPF version": load generator → "real TCP connections" arrow → kernel box containing the eBPF program reading M_Sel and selecting a socket; below, 4 workers, each with its own listening socket and epoll instance, same event loop and scheduler, but writing M_Sel via a system call; shared-memory strip carrying the WST.
-
-Caption: The two implementations side by side. The Worker Status Table, the scheduler and its cascading filters, and the dispatcher's selection logic are the same code in both. What differs is everything around them: in the simulation a parent process stands in for the kernel and connections are synthetic; in the eBPF version connections arrive over a real network port and the dispatch decision is executed inside the kernel.]
+Caption: The two implementations side by side. The Worker Status Table, the scheduler and its cascading filters, and the dispatcher's selection logic are the same code in both; what differs is the machinery around them.]
 
 6.2 Worker Status Table
 
@@ -432,9 +428,9 @@ One simplification shared by both versions must be stated before any results. Bo
 
 A second, smaller difference: the simulation collects at most 4 events per loop iteration where the eBPF version collects up to 64 (the smaller limit stops the simulation's millisecond-scale processing stretching one iteration past the hang threshold, Section 7.5). The eBPF version can therefore spend much longer inside a single iteration, which is visible in its hang-detection trace (Section 8.4) and its sharper filter pruning (Section 8.5), but does not affect the per-connection latency or balance figures.
 
-[TABLE 1 HERE — summary statistics for the simulation (regenerate from analysis/results; the committed summary_stats.tex now holds the eBPF version's figures, which appear as Table 3).
+[TABLE 1 HERE — regenerate from analysis/results (the committed summary_stats.tex holds the eBPF version's figures, used for Table 3).
 
-Caption: Simulation: latency and balance per dispatch policy across all five scenarios at each case's characteristic load level (mean over 3 trials; p99 shown ± sd across trials). Case 5 rows are burst follow-up requests, measured from the burst instant.]
+Caption: Simulation: latency and balance per dispatch policy across all five scenarios at each case's characteristic load level (mean over 3 trials). Case 5 rows are burst follow-up requests.]
 
 8.2 Results: The Simulation
 
@@ -442,11 +438,11 @@ Throughout this section, the epoll-exclusive baseline is a model written by the 
 
 [FIGURE 2 HERE — latency distributions, simulation (regenerate from analysis/results)
 
-Caption: Simulation: latency distributions (queueing + processing) per dispatch policy, one panel per workload case at its characteristic load level, log x-axis, trials pooled. In the light-load cases (1 and 3) the three policies are indistinguishable; under load (Cases 2 and 4) reuseport's blind hash produces a heavy tail while Micro-Hermes routes around busy or stalled workers.]
+Caption: Simulation: latency distributions per dispatch policy, one panel per workload case at its characteristic load level, log x-axis, trials pooled.]
 
 [FIGURE 3 HERE — 99th-percentile bars, simulation (regenerate from analysis/results)
 
-Caption: Simulation: 99th-percentile connection latency per policy (bars: mean of per-trial p99; error bars: min–max across trials; note the independent y-scales). Under load, reuseport's p99 exceeds Micro-Hermes's by roughly 30% in Case 2 and 2.2x in Case 4. The LIFO model's low latency in those cases is discussed in Section 8.6; Figure 6 shows the liability that accompanies it.]
+Caption: Simulation: 99th-percentile connection latency per policy (bars: mean of per-trial p99; error bars: min–max across trials; independent y-scales).]
 
 Case 1 (high CPS, low cost). Far below capacity, all three policies deliver essentially the same latency: every policy completes a typical connection in 1.3 ms. They differ sharply in fairness. Across the 1,200 connections of a run, Micro-Hermes distributes most evenly (a standard deviation of 14 connections between workers, against 29 for reuseport), while the epoll-exclusive model sends every single connection to the wait-queue head worker (520): each request finishes before the next arrives, so the head worker is always idle again in time to be woken next. Micro-Hermes's tail is marginally higher than the baselines' (99th percentile 1.9 ms against 1.4 ms), for a structural reason: Stage 3 never picks the single best worker, only hashes each connection to one of Stage 2's candidates, so a few connections land on a candidate momentarily busier than an excluded worker. This matches the paper's ranking, which places reuseport marginally ahead of Hermes when load is trivially light: worker-awareness has nothing to protect against yet, so its overhead shows up as pure cost.
 
@@ -456,11 +452,11 @@ Case 3 (low CPS, long-lived connections). This case reproduces the paper's headl
 
 [FIGURE 4 HERE — balance over time, simulation (regenerate from analysis/results)
 
-Caption: Simulation: standard deviation of per-worker open-connection counts during a Case 3 run (long-lived connections; mean over trials, bands span min–max). Micro-Hermes and reuseport hold the imbalance near-flat; under the LIFO model it grows linearly, since at this low arrival rate the head worker is always idle again before the next connection arrives.]
+Caption: Simulation: standard deviation of per-worker open-connection counts during a Case 3 run (mean over trials, bands span min–max).]
 
 [FIGURE 5 HERE — concentration profile, simulation (regenerate from analysis/results)
 
-Caption: Simulation: connections handled per worker in Case 3, ranked busiest to least busy within each trial (bars: mean over trials; error bars: min–max; dashed line: even share). The LIFO head worker takes all 240 connections in every trial; Micro-Hermes and reuseport sit close to the even share at every rank.]
+Caption: Simulation: connections handled per worker in Case 3, ranked busiest to least busy within each trial (bars: mean over trials; error bars: min–max; dashed line: even share).]
 
 Case 4 (low CPS, high cost). With expensive requests at moderate utilisation (about 75%), the danger is queueing a new connection behind a slow worker which is already busy. Micro-Hermes avoids this: its 99th-percentile latency of 442 ms is less than half of reuseport's 975 ms, which hashes blindly. The epoll-exclusive model again leads (295 ms), with Micro-Hermes tracking it as the paper predicts: Hermes's status detection reacts with a small delay where exclusive reacts immediately.
 
@@ -468,15 +464,15 @@ Case 5 (synchronised burst on long-lived connections). Cases 1 to 4 measure the 
 
 [FIGURE 6 HERE — burst latency, simulation (regenerate from analysis/results)
 
-Caption: Simulation: latency of follow-up requests when every open connection fires one simultaneously (Case 5, ~150 open connections at burst time, trials pooled). Under the LIFO model one worker owns every connection and serialises the entire burst (the straight-diagonal CDF is the signature of a single queue draining at a constant rate); Micro-Hermes and reuseport complete it 3 to 4x faster.]
+Caption: Simulation: latency of follow-up requests when every open connection fires one simultaneously (Case 5, ~150 open connections at burst time, trials pooled).]
 
 Across all five cases Micro-Hermes never collapses: where it is not the best policy it trails by a small margin, whereas each baseline fails badly in at least one regime. This adaptability, rather than outright victory in any single regime, is the core property claimed for the Hermes architecture, and the simulation reproduces it.
 
 Load sensitivity. Table 2 repeats the comparison at light, medium and heavy load for each of the four cases.
 
-[TABLE 2 HERE — load sweep, simulation (regenerate from analysis/results; the committed load_sweep.tex now holds the eBPF version's sweep, which appears as Table 4)
+[TABLE 2 HERE — regenerate from analysis/results (the committed load_sweep.tex holds the eBPF version's sweep, used for Table 4).
 
-Caption: Simulation: load sweep. Mean latency, P99 and throughput per policy at light/medium/heavy offered load in each case (mean over 3 trials). Every Case 2 level carries the injected stall.]
+Caption: Simulation: mean latency, P99 and throughput per policy at light/medium/heavy offered load in each case (mean over 3 trials). Every Case 2 level carries the injected stall.]
 
 The sweep confirms the rankings are not artefacts of one operating point, and reproduces the paper's central claim that the value of worker-awareness grows with load. In Case 1, where the policies are indistinguishable at light and medium load, heavy load (75% utilisation) separates them: reuseport's mean rises to 13.4 ms and its 99th percentile to 33 ms as hash collisions land connections behind busy workers, while Micro-Hermes holds 3.7 ms and 24 ms, reproducing the paper's ranking flip for this case. In Cases 2 and 4 the gap over reuseport widens monotonically with load: Case 4's mean-latency ratio grows from 1.2x at light load to 2.8x at heavy. Throughput agrees: once offered load approaches capacity, reuseport can no longer sustain the arrival rate (at Case 2's medium level it completes 59 connections/s of the 75 offered where Micro-Hermes completes 69), because connections hashed onto overloaded workers sit in queues rather than completing. Case 3 shows latency parity at every level, as expected: its failure mode is balance, not latency. The epoll-exclusive model posts the lowest raw latency at every level of Cases 2 and 4; Section 8.6 tests the simulation's explanation for this against the real mechanism.
 
@@ -486,7 +482,7 @@ This section reports the same experiment run against the working system: real so
 
 [TABLE 3 HERE — analysis/tables/summary_stats.tex
 
-Caption: eBPF version: latency and balance per dispatch policy across all five scenarios at each case's characteristic load level (mean over 3 trials; p99 shown ± sd across trials). Latency is measured by the client and includes connection setup and network-stack costs, so these figures are not directly comparable with Table 1's (Section 8.1).]
+Caption: eBPF version: latency and balance per dispatch policy across all five scenarios at each case's characteristic load level (mean over 3 trials). Latency is measured by the client, so figures are not directly comparable with Table 1's (Section 8.1).]
 
 [TABLE 4 HERE — analysis/tables/load_sweep.tex
 
@@ -498,19 +494,19 @@ Caption: eBPF version: latency distributions per dispatch policy, one panel per 
 
 [FIGURE 8 HERE — analysis/figures/fig2_p99_bars.pdf
 
-Caption: eBPF version: 99th-percentile latency per policy (bars: mean of per-trial p99; error bars: min–max across trials; independent y-scales). Micro-Hermes holds the best tail in the overloaded Case 2 despite not holding the best mean.]
+Caption: eBPF version: 99th-percentile latency per policy (bars: mean of per-trial p99; error bars: min–max across trials; independent y-scales).]
 
 [FIGURE 9 HERE — analysis/figures/fig3_balance_over_time.pdf
 
-Caption: eBPF version: standard deviation of per-worker open-connection counts during a Case 3 run. Micro-Hermes and reuseport hold the imbalance near-flat as connections accumulate; under real epoll exclusive it grows steadily, since the kernel keeps waking whichever worker is already free.]
+Caption: eBPF version: standard deviation of per-worker open-connection counts during a Case 3 run.]
 
 [FIGURE 10 HERE — analysis/figures/fig4_concentration_profile.pdf
 
-Caption: eBPF version: connections held per worker in Case 3, ranked busiest to least busy within each trial (dashed line: even share). Real epoll exclusive concentrates onto a small number of workers; Micro-Hermes and reuseport sit close to the even share at every rank.]
+Caption: eBPF version: connections held per worker in Case 3, ranked busiest to least busy within each trial (dashed line: even share).]
 
 [FIGURE 11 HERE — analysis/figures/fig7_burst.pdf
 
-Caption: eBPF version: latency of follow-up requests when every open connection fires one simultaneously (Case 5, 240 connections, trials pooled, measured from the burst instant). Under epoll exclusive the burst is served by an average of 2.0 workers against 4.0 for the other two policies, and takes roughly 3.4x longer at the tail.]
+Caption: eBPF version: latency of follow-up requests when every open connection fires one simultaneously (Case 5, 240 connections, trials pooled, measured from the burst instant).]
 
 Case 1 (high CPS, low cost). At light and medium load the three policies are again close, with Micro-Hermes marginally ahead on both mean and tail (1.2 ms and 1.9 ms at light, against 1.3/2.3 for reuseport). Balance behaves as the architecture predicts: Micro-Hermes spreads most evenly (standard deviation 13.7 against reuseport's 14.5), while epoll exclusive concentrates severely (460), the same pathology the simulation's model showed.
 
@@ -538,7 +534,7 @@ The eBPF version shows the same mechanism operating, and Figure 12 traces one ep
 
 [FIGURE 12 HERE — analysis/figures/fig5_hang_detection.pdf
 
-Caption: eBPF version: hang detection during a Case 2 run with a 400 ms stall injected into worker 0 (shaded). Top: worker 0's pending-event count, which flatlines during the stall and then spikes as the backlog arrives. Bottom: worker 0's presence in the candidate bitmap: excluded across the stall, briefly readmitted when it resumes, then excluded again while it drains the backlog.]
+Caption: eBPF version: hang detection during a Case 2 run with a 400 ms stall injected into worker 0 (shaded). Top: worker 0's pending-event count. Bottom: worker 0's presence in the candidate bitmap: excluded across the stall, briefly readmitted, then excluded again while it drains the backlog.]
 
 In both versions the exclusion is carried out by the other workers' schedulers, since the stalled worker cannot run its own. This confirms the value of embedding the scheduler in every worker rather than running it as a separate process: the component that notices a failure is never the component that failed. Over the same window, the reuseport baseline keeps assigning its usual share of new connections to the stalled worker, exactly the failure mode that motivated Hermes's timestamp-based detection.
 
@@ -548,7 +544,7 @@ The per-stage survivor counts recorded at every scheduling pass show the cascadi
 
 [FIGURE 13 HERE — analysis/figures/fig6_cascade_stages.pdf
 
-Caption: eBPF version: mean number of workers surviving each stage of the scheduler's cascading filter, per case (Hermes runs; error bars: ±1 sd across trials). The light-load cases prune nothing; the overloaded Case 2 prunes hardest; only the two expensive cases see the liveness filter remove anyone.]
+Caption: eBPF version: mean number of workers surviving each stage of the scheduler's cascading filter, per case (Hermes runs; error bars: ±1 sd across trials).]
 
 In both versions, Case 2 is where the liveness filter itself prunes hardest, and not only because of the injected stall: a worker that spends several hundred milliseconds inside a single loop iteration processing slow events looks, from the status table's point of view, exactly like a hung worker, and gets treated as one. This is arguably correct, since either way it cannot accept new work promptly. Overall, both versions match the paper's observation that the fraction of workers passing the coarse filter shrinks as load increases, while theta's margin stops the set collapsing to a single candidate, which would forfeit the kernel's fine-grained selection and trigger the fallback path. The sharper pruning in the eBPF version is consistent with its workers facing real costs the simulation did not impose.
 
@@ -616,32 +612,25 @@ The broader conclusion is encouraging for replication research. A carefully writ
 
 Appendix A: Testing Summary
 
-Correctness was established at three levels: unit tests over the algorithmic components, mechanical validation of whole-system behaviour against the paper's predictions, and integrity checks in the analysis pipeline.
+Correctness was established at three levels: unit tests over the algorithmic components, benchmark-driven validation of whole-system behaviour against the paper's predictions, and integrity checks in the analysis pipeline.
 
-Traceability to requirements. Each level of testing was chosen to close off a specific requirement from Chapter 3, rather than testing being an undirected activity performed after the fact. FR1 (the WST) and FR2/FR3 (Algorithms 1 and 2) are the requirements with the most precise published specification, so they receive direct unit tests: a test exists for each clause of each algorithm's definition, described below. FR4 (the instrumented event loop), FR5 (the baselines) and FR6 (the workload generator) are harder to test in isolation, since their correctness is behavioural rather than a fixed input/output mapping; these are instead verified through the whole-system predicates, which encode the paper's per-regime expectations and would fail if the loop, a baseline, or the generator misbehaved. FR7 (metrics recording) is verified by the analysis pipeline's data-integrity checks. NFR1 (lock-free concurrency) is exercised directly by the SPSC ring test's wrap-around and overflow cases. This mapping is what "the testing verifies the requirements" means in this project: every must-have requirement in Chapter 3 is the deliberate target of a named test or predicate below, not an incidental side effect of testing the code that happened to get written.
+Each level targets specific requirements from Chapter 3. FR1-FR3 (the WST and the two algorithms) have the most precise published specification and receive direct unit tests. FR4-FR6 (the event loop, the baselines and the workload generator) are behavioural, and are verified through the whole-system predicates, which would fail if any of them misbehaved. FR7 (metrics recording) is verified by the pipeline's data-integrity checks, and NFR1 (lock-free concurrency) by the ring-buffer tests.
 
-Unit tests (17 tests, run with cargo test) cover the components whose correctness the evaluation depends on:
+The 17 unit tests (run with cargo test) cover: the scheduler's three filters, including hang detection and readmission, cold-start permissiveness, average-plus-theta pruning and theta's floor; the dispatcher's reciprocal_scale (matching the kernel's implementation exactly), Nth-set-bit selection and fallback rule; the simulation's epoll-exclusive model (the eBPF version needs no equivalent, since the kernel provides the mechanism); and the shared-memory ring's ordering, overflow rejection and index wrap-around. The scheduler's tests carry over to the eBPF version unmodified, because the scheduler itself does, confirming the design boundary described in Section 6.1.
 
-- Algorithm 1 (scheduler): the time filter marks a worker unavailable once its loop-entry timestamp exceeds the hang threshold and readmits it after a fresh stamp; cold-start behaviour is permissive (a worker with no history is not spuriously filtered); the connection-count and event-count filters prune workers above average-plus-theta and no others; and theta's floor prevents the candidate set collapsing when all workers are near-uniformly loaded.
-- Algorithm 2 (dispatcher): reciprocal_scale maps arbitrary 32-bit hashes into [0, n) exactly as the kernel's implementation does; Nth-set-bit selection returns the correct worker for every bitmap and index combination tested; and the fallback rule engages when the bitmap has one or zero set bits, dispatching by plain hash across all workers.
-- The epoll-exclusive baseline (simulation only): the wait-queue model prefers the highest-registered idle worker and falls back to the shortest backlog only when no worker is idle. The eBPF version needs no equivalent test, because it does not implement this baseline at all — it configures the sockets so the kernel performs it.
-- The shared-memory SPSC ring: values round-trip in order, a full ring rejects rather than overwrites, and head/tail indices wrap correctly past the buffer boundary.
+Whole-system validation is benchmark driven. The paper's qualitative expectations were written down as eight machine-checkable predicates before the benchmarks were run (for example: "Case 3: LIFO's open-connection SD exceeds three times either alternative's"), and the analysis notebook evaluates them against every run. Data integrity is asserted at load time: every policy × case × load × trial combination must be present, with no negative latencies.
 
-The scheduler's tests transfer to the eBPF version unmodified, because the scheduler itself does. This is a small but concrete confirmation of the design boundary described in Section 6.1: the component that carries the architecture's logic was never coupled to how connections arrive.
+All eight predicates hold for the simulation. For the eBPF version, seven hold and one fails: Micro-Hermes's Case 4 tail-latency advantage over reuseport is 1.40x where the predicate, calibrated in advance against the simulation's numbers, required 1.5x. The direction of the result is unchanged and the margin still widens with load; the threshold is reported as failing rather than quietly re-tuned.
 
-Whole-system validation is benchmark-driven. The paper's qualitative expectations per traffic regime were written down as explicit, machine-checkable predicates before the benchmarks were run (for example: "Case 3: LIFO's open-connection SD exceeds three times either alternative's" or "all cases: Hermes never posts the worst P99 outside measurement parity"). The analysis notebook evaluates all eight predicates against every run and prints a pass/fail verdict table. Data integrity is asserted at load time: every expected policy × case × load × trial combination must be present, and no negative latencies may exist.
-
-All eight predicates hold for the simulation. For the eBPF version, seven hold and one fails: the predicate requiring Micro-Hermes's 99th-percentile latency in Case 4 to beat reuseport's by more than 1.5x is not met, since the measured ratio is 1.40x (494.2 ms against 691.2 ms). The predicate is reported as failing rather than being relaxed to fit. Two things are worth noting about it. The direction of the result is unchanged — Micro-Hermes still beats reuseport on both mean and tail latency in Case 4, at every load level, and the margin still widens as load rises, reaching 1.57x at heavy load. What failed is a threshold chosen in advance against the simulation's numbers, which is exactly what a pre-registered threshold is for: it fails visibly when the system changes underneath it, rather than being quietly re-tuned afterwards.
-
-Debugging during development relied on the VERBOSE per-iteration trace (every worker loop iteration with its WST snapshot and scheduling decision) and on the per-run console summary, which reports per-worker dispatch/completion/drop counts that must reconcile with the generator's totals. The two artefacts recorded in Section 7.5 — the unsound shared-memory Mutex&lt;Vec&gt; and the phase-locked timer artefact in the LIFO baseline — were both found through these traces. In the eBPF version the load balancer additionally logs its own startup sequence, which is where a failure to load or attach the kernel program surfaces, and the per-run script fails loudly if the load balancer exits before it is listening rather than silently producing an empty result file.
+Debugging relied on the VERBOSE per-iteration trace and the per-run console summary, whose per-worker counts must reconcile with the generator's totals; both artefacts recorded in Section 7.5 were found through these traces. The eBPF version's per-run script additionally fails loudly if the load balancer exits before it is listening, rather than silently producing an empty result file.
 
 Appendix B: User Manual
 
-The two versions have different requirements and are built and run separately. The simulation runs on any Unix-like system; the eBPF version requires Linux, because it loads a program into the Linux kernel.
+The two versions are built and run separately: the simulation runs on any Unix-like system, while the eBPF version requires Linux, because it loads a program into the kernel.
 
 Part 1: The Simulation
 
-Requirements. A stable Rust toolchain (rustup.rs); any Unix-like OS with libc (developed on macOS, runs on Linux; no OS-specific code paths). The analysis pipeline additionally needs Python 3 with pandas, numpy and matplotlib, and Jupyter.
+Requirements. A stable Rust toolchain; the analysis pipeline additionally needs Python 3 with pandas, numpy, matplotlib and Jupyter.
 
 Building and running a single simulation, from the phase1/ directory:
 
@@ -663,49 +652,40 @@ For example, the overloaded compression-heavy case under the Hermes policy:
 
     POLICY=hermes WORKLOAD_CASE=2 LOAD=heavy cargo run --release
 
-Each run prints a summary (per-worker dispatch/completion counts, balance SDs, and latency percentiles) and writes the two CSVs. Unit tests run with `cargo test`.
+Each run prints a summary and writes the two CSVs. Unit tests run with `cargo test`.
 
-The simulation's full benchmark matrix (3 policies × {4 cases × 3 load levels + Case 5} × 3 trials, roughly 8 minutes) is driven by `analysis/run_benchmarks.sh`, which writes per-run CSVs into `analysis/results/`. Existing result files are skipped, so an interrupted run can be resumed; delete the directory to force a full regeneration.
+The full benchmark matrix (3 policies × {4 cases × 3 load levels + Case 5} × 3 trials, roughly 8 minutes) is driven by `analysis/run_benchmarks.sh`, which writes per-run CSVs into `analysis/results/`, skipping existing files so an interrupted run can be resumed.
 
 Part 2: The eBPF Version
 
-Requirements. Linux (developed against current Ubuntu). Beyond the stable Rust toolchain, the eBPF program needs the nightly toolchain with the `rust-src` component and the `bpf-linker` tool, since compiling code for the kernel's own instruction set is not part of the standard toolchain:
+Requirements. Linux (developed against current Ubuntu). Beyond the stable Rust toolchain, compiling the kernel program needs the nightly toolchain with `rust-src` and the `bpf-linker` tool:
 
     rustup toolchain install nightly --component rust-src
     cargo install cargo-binstall && cargo binstall bpf-linker
 
-Loading a program into the kernel and attaching it to a socket both require administrator privileges, so the load balancer is started under `sudo`. The `reuseport` and `lifo` policies do not strictly need this, since they involve no eBPF, but the benchmark scripts start every policy the same way for consistency.
+Loading a program into the kernel requires administrator privileges, so the benchmark scripts start the load balancer under `sudo` for every policy.
 
 Building both binaries, from the repository root:
 
     cargo build --release -p hermes -p hermes-bench
 
-Running one benchmark point end to end, which starts the load balancer, waits for it to be listening, runs the load generator against it, and shuts it down:
+Running one benchmark point end to end (starts the load balancer, runs the load generator against it, shuts it down):
 
     benchmark/run_case.sh <policy> <case> <load> <trial>
-
-for example:
-
-    benchmark/run_case.sh hermes 2 heavy 1
 
 The full matrix, matching the simulation's:
 
     benchmark/run_all.sh          # 3 trials
     TRIALS=5 benchmark/run_all.sh # more trials for tighter error bars
 
-Because every point starts and stops a real process under `sudo`, this is considerably slower per point than the simulation. Running `sudo -v` first, or configuring a passwordless rule for the `hermes` binary, avoids repeated password prompts across the matrix. Results are written to `benchmark/results/`, one file of per-connection records from the load generator plus one file of per-iteration records from each worker.
+Results are written to `benchmark/results/`: per-connection records from the load generator plus per-iteration records from each worker.
 
 Part 3: Regenerating Figures and Tables
 
     cd analysis && jupyter lab hermes_analysis.ipynb
     # then: Kernel → Restart & Run All
 
-or headless:
-
-    jupyter nbconvert --to notebook --execute --inplace \
-        analysis/hermes_analysis.ipynb
-
-The notebook reads whichever results directory it is pointed at, runs the benchmark matrix if results are missing, and regenerates all figures (`analysis/figures/`, PNG and PDF) and tables (`analysis/tables/`, CSV and LaTeX). Note that the two versions write to different results directories, `analysis/results/` for the simulation and `benchmark/results/` for the eBPF version, and that the notebook's output paths are shared, so regenerating one version's artefacts will overwrite the other's. Point the notebook's `RESULTS_DIR` at the version being analysed, and direct its output elsewhere if both sets are needed at once.
+The notebook regenerates all figures (`analysis/figures/`) and tables (`analysis/tables/`) from whichever results directory its `RESULTS_DIR` points at: `analysis/results/` for the simulation, `benchmark/results/` for the eBPF version. The output paths are shared, so regenerating one version's artefacts overwrites the other's unless the output is redirected.
 
 Appendix C: Ethics Self-Assessment
 

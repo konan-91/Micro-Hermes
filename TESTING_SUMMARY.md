@@ -1,0 +1,13 @@
+# Testing Summary
+
+Correctness was established at three levels: unit tests over the algorithmic components, benchmark-driven validation of whole-system behaviour against the paper's predictions, and integrity checks in the analysis pipeline.
+
+Each level targets specific requirements from Chapter 3. FR1-FR3 (the WST and the two algorithms) have the most precise published specification and receive direct unit tests. FR4-FR6 (the event loop, the baselines and the workload generator) are behavioural, and are verified through the whole-system predicates, which would fail if any of them misbehaved. FR7 (metrics recording) is verified by the pipeline's data-integrity checks, and NFR1 (lock-free concurrency) by the ring-buffer tests.
+
+The 17 unit tests (run with cargo test) cover: the scheduler's three filters, including hang detection and readmission, cold-start permissiveness, average-plus-theta pruning and theta's floor; the dispatcher's reciprocal_scale (matching the kernel's implementation exactly), Nth-set-bit selection and fallback rule; the simulation's epoll-exclusive model (the eBPF version needs no equivalent, since the kernel provides the mechanism); and the shared-memory ring's ordering, overflow rejection and index wrap-around. The scheduler's tests carry over to the eBPF version unmodified, because the scheduler itself does, confirming the design boundary described in Section 6.1.
+
+Whole-system validation is benchmark driven. The paper's qualitative expectations were written down as eight machine-checkable predicates before the benchmarks were run (for example: "Case 3: LIFO's open-connection SD exceeds three times either alternative's"), and the analysis notebook evaluates them against every run. Data integrity is asserted at load time: every policy × case × load × trial combination must be present, with no negative latencies.
+
+All eight predicates hold for the simulation. For the eBPF version, seven hold and one fails: Micro-Hermes's Case 4 tail-latency advantage over reuseport is 1.40x where the predicate, calibrated in advance against the simulation's numbers, required 1.5x. The direction of the result is unchanged and the margin still widens with load; the threshold is reported as failing rather than quietly re-tuned.
+
+Debugging relied on the VERBOSE per-iteration trace and the per-run console summary, whose per-worker counts must reconcile with the generator's totals; both artefacts recorded in Section 7.5 were found through these traces. The eBPF version's per-run script additionally fails loudly if the load balancer exits before it is listening, rather than silently producing an empty result file.

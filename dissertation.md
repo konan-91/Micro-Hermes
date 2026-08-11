@@ -52,7 +52,7 @@ All five objectives were met. O1, O2 and O4 were achieved in full in the simulat
 
 1.4 Report Structure
 
-Chapter 2 provides the necessary background and reviews related work: load balancing and the Layer 4 / Layer 7 distinction, the Linux mechanisms for distributing connections, the research systems that have tried to improve on them, eBPF, and the Hermes architecture itself, closing with where Micro-Hermes sits in that body of work. Chapter 3 specifies the requirements the software had to meet, distinguishing those inherited from the Hermes paper from those the author added. Chapter 4 describes the development process, and Chapter 5 records ethical considerations. Chapter 6 presents the design, which both versions share, and Chapter 7 the two implementations. Chapter 8 evaluates them, reporting each version's results and then comparing the two directly. Chapter 9 concludes with contributions, limitations, and remaining work. Appendices provide the testing summary, a user manual for building and reproducing every result, and the ethics self-assessment.
+Chapter 2 provides the necessary background and reviews related work: load balancing and the Layer 4 / Layer 7 distinction, the Linux mechanisms for distributing connections, the research systems that have tried to improve on them, eBPF, and the Hermes architecture itself, closing with where Micro-Hermes sits in that body of work. Chapter 3 specifies the requirements the software had to meet, distinguishing those inherited from the Hermes paper from those the author added. Chapter 4 describes the development process, and Chapter 5 records ethical considerations. Chapter 6 presents the design, which both versions share, and Chapter 7 the two implementations. Chapter 8 evaluates them, reporting each version's results and then comparing the two directly. Chapter 9 concludes with contributions, limitations, and remaining work. An appendix provides the ethics self-assessment; the testing summary and the user manual for building and reproducing every result accompany the code in the repository (TESTING_SUMMARY.md and README.md).
 
 2. Background and Related Work
 
@@ -202,7 +202,7 @@ The first increment was a stripped-down simulator: four simulated cores running 
 
 Git and GitHub were used extensively. Changes were committed whenever a milestone was reached, such as completing one component of the simulator like the dispatcher, so a functioning state always existed to fall back on (which was sometimes necessary). The simulation and the eBPF version were kept on separate development branches so that eBPF code could override simulated components while retaining the ability to switch between the two versions at any point.
 
-Testing was benchmark driven. The rankings the paper expects in each traffic regime were written down as explicit validation targets before the benchmarks were run, and the analysis pipeline checks them automatically (Section 8.1); because the targets were fixed in advance, one now fails for the eBPF version and is reported as failing (Appendix A) rather than retuned after the fact. The analysis notebook, benchmark scripts and results are all kept in the repository, so the evaluation can be reproduced from a clean checkout.
+Testing was benchmark driven. The rankings the paper expects in each traffic regime were written down as explicit validation targets before the benchmarks were run, and the analysis pipeline checks them automatically (Section 8.1); because the targets were fixed in advance, one now fails for the eBPF version and is reported as failing (Section 8.1) rather than retuned after the fact. The analysis notebook, benchmark scripts and results are all kept in the repository, so the evaluation can be reproduced from a clean checkout.
 
 Development was done on macOS with a separate Linux machine for the eBPF code. After reflection, this split worked poorly as issues appeared on one device but not the other (macOS handles primitives such as locks differently) and switching between devices occasionally lost work; a single environment should be used next time. Time management worked better. A few hours each day were dedicated to the project, with deadlines set for milestones such as finishing the simulator, leaving room to pull back scope if objectives were not achieved in time.
 
@@ -230,7 +230,7 @@ Caption: The two implementations side by side. The Worker Status Table, the sche
 
 6.2 Worker Status Table
 
-The WST holds, per worker, the three status metrics of Section 2.8, each stored as an individually atomic 64-bit integer: the timestamp of the most recent event-loop entry, the count of pending events delivered by epoll_wait but not yet handled, and the count of open connections. The paper draws the table as one row per metric spanning all workers; this implementation transposes it into one slot per worker, which changes nothing about who reads or writes which field. Each slot is padded to a 64-byte cache line to prevent false sharing between workers on adjacent cores.
+The WST holds, per worker, the three status metrics of Section 2.8: the timestamp of the most recent event-loop entry, the count of pending events delivered by epoll_wait but not yet handled, and the count of open connections. Each field is individually atomic, so a reader can never observe a torn value. How the fields are represented and laid out in memory is an implementation decision, recorded in Section 7.1.
 
 The concurrency design is preserved exactly: the table is partitioned by writer, each worker updates only its own slot, and the scheduler reads the whole table without locks. Reads may race with updates from other workers; as in the original system this is accepted by design, since per-field atomicity prevents torn values and a slightly stale metric does not meaningfully affect scheduling decisions.
 
@@ -262,15 +262,15 @@ In both versions, every worker runs the paper's 5 ms event-loop timeout under ev
 
 7. Implementation
 
-This chapter covers both implementations: what they share (Section 7.1), what is specific to each (Sections 7.2 and 7.3), one shared property that bounds what either can claim (Section 7.4), and the problems encountered along the way (Section 7.5).
+The core components, the Worker Status Table, the scheduler, the dispatcher's selection logic, and the traffic scenarios, are implemented once and used by both versions (Section 7.1). What differs is the surrounding machinery: the simulation stands in for the operating system (Section 7.2), and the eBPF version swaps those stand-ins for the real kernel (Section 7.3). Section 7.4 records one property that bounds what either version can claim, and Section 7.5 the problems encountered along the way.
 
-7.1 Shared Foundations
+7.1 Shared Components
 
 Both versions are written in Rust, for the reasons given in Chapter 3, and both take the same components unchanged: the Worker Status Table, the scheduler and its three cascading filters, the dispatcher's selection logic, and the definitions of all five traffic scenarios. These are the substance of the architecture being replicated; what changes between versions is the machinery around them.
 
-The simulation is about 1,750 lines across nine modules with a single dependency (libc, for mmap, fork and waitpid). The eBPF version adds roughly 2,100 lines across four crates: the program that runs inside the kernel, definitions shared between kernel and userspace code, the load-balancer process itself, and a separate load generator. Unit tests cover the scheduler's filters, the dispatcher's bit manipulation, and the shared-memory queue; the scheduler's tests carry over to the eBPF version unmodified, because the scheduler itself did.
+The simulation is 1,753 lines across nine modules with a single dependency (libc, for mmap, fork and waitpid). The eBPF version adds 2,097 lines across four crates: the program that runs inside the kernel, definitions shared between kernel and userspace code, the load-balancer process itself, and a separate load generator. Unit tests cover the scheduler's filters, the dispatcher's bit manipulation, and the shared-memory queue; the scheduler's tests carry over to the eBPF version unmodified, because the scheduler itself did.
 
-In both versions the Worker Status Table lives in memory shared between processes, mapped before the workers are forked so that parent and children address the same physical pages. Each worker writes only its own slot, padded to a cache line so that workers updating their status do not contend for the same piece of memory.
+In both versions the Worker Status Table lives in memory shared between processes, mapped before the workers are forked so that parent and children address the same physical pages. Each of the three status metrics is stored as an individually atomic 64-bit integer. The paper draws the table as one row per metric spanning all workers; this implementation transposes it into one slot per worker, which changes nothing about who reads or writes which field. Each worker writes only its own slot, padded to a 64-byte cache line to prevent false sharing between workers on adjacent cores.
 
 7.2 The Simulation
 
@@ -300,7 +300,7 @@ Building the preliminary simulator described in Chapter 4 paid off as the closed
 
 First, metrics collection across fork(): an early design accumulated benchmark records in a mutex-protected vector placed in the shared region, which was not sound. A vector's heap allocation is not in the shared mapping, and standard-library mutexes are undefined across processes on some platforms (most development took place on MacOS, for instance). Each worker instead buffers records privately and writes its own file shard, which the parent merges at the end, applying the WST's single-writer partitioning idea to the benchmarking plumbing itself.
 
-Second, a modelling error in the simulation's epoll-exclusive baseline. An early version modelled the wait-queue head dynamically and gave idle baseline workers a periodic housekeeping timer; because the workers are forked simultaneously, their timers fired in lock-step, rotating which worker was preferred about once a second and producing artificially balanced per-worker totals that masked the very pathology the baseline exists to demonstrate. The fix was to model what the kernel actually does: queue order fixed at registration time, with the last-registered worker permanently at the head. With a static order, idle wakeups no longer reshuffle priority, so every policy can safely share the paper's 5 ms timer.
+Second, a modelling error in the simulation's epoll-exclusive baseline. An early version modelled the wait-queue head dynamically and gave idle baseline workers a periodic housekeeping timer; because the workers are forked simultaneously, their timers fired in lock-step, rotating which worker was preferred once a second and producing artificially balanced per-worker totals that masked the very pathology the baseline exists to demonstrate. The fix was to model what the kernel actually does: queue order fixed at registration time, with the last-registered worker permanently at the head. With a static order, idle wakeups no longer reshuffle priority, so every policy can safely share the paper's 5 ms timer.
 
 Third, batch sizing in the simulation. Real Layer 7 events cost microseconds, but the simulated per-event sleeps cost milliseconds, so a conventional batch limit would stretch a single loop iteration past the hang-detection threshold and starve the scheduler of fresh status data. The simulation's limit is therefore kept small, at 4 events, preserving the paper's property that scheduler frequency scales with load. The eBPF version retained the conventional limit of 64, the more realistic choice for a real event loop, but one that lets it spend far longer inside one iteration when events are expensive. Section 8.1 records how this difference affects the per-iteration measurements without affecting the per-connection ones.
 
@@ -314,21 +314,23 @@ This chapter evaluates both versions. Section 8.1 sets out the method, common to
 
 8.1 Evaluation Framework and Methodology
 
-The evaluation reproduces the four traffic regimes used by Pan et al. (2025), characterised by connections-per-second (CPS) and per-connection processing cost: Case 1, high CPS with low cost (a stress or traffic-spike scenario); Case 2, high CPS with high cost (a sustained overload at roughly 112% of aggregate worker capacity, with a 400 ms stall injected into one worker); Case 3, low CPS with low cost, but long-lived connections that never close within the run (the finance/chat pattern, and the most common case in Alibaba's production); and Case 4, low CPS with high cost (TLS- and regex-heavy web services). A fifth scenario, beyond the paper's four, repeats Case 3's accumulation of long-lived connections and then fires a follow-up request on every open connection simultaneously, providing direct evidence for the cost of connection concentration.
+The evaluation reproduces the four traffic regimes used by Pan et al. (2025), characterised by connections-per-second (CPS) and per-connection processing cost: Case 1, high CPS with low cost (a stress or traffic-spike scenario); Case 2, high CPS with high cost (a sustained overload at 112.5% of aggregate worker capacity, with a 400 ms stall injected into one worker); Case 3, low CPS with low cost, but long-lived connections that never close within the run (the finance/chat pattern, and the most common case in Alibaba's production); and Case 4, low CPS with high cost (TLS- and regex-heavy web services). A fifth scenario, beyond the paper's four, repeats Case 3's accumulation of long-lived connections and then fires a follow-up request on every open connection simultaneously, providing direct evidence for the cost of connection concentration.
 
 Following the paper's methodology, each case is additionally swept across three offered-load levels, light, medium and heavy, by scaling its connection arrival rate while holding its cost distribution fixed (Case 3's cost is trivial, so its levels instead scale how many long-lived connections accumulate). The per-case analysis in Sections 8.2 and 8.3 uses each case's characteristic level, the one at which its defining behaviour is clearest: light for Case 1, heavy for Case 2, medium for Cases 3 and 4. The full sweep is then reported for each version (Tables 2 and 4) to test whether the rankings hold as load varies, which is where the paper's own rankings are defined.
 
 Each policy runs against every case and load level three times, with a per-trial seed varying the sequence of connection identifiers and sampled costs. Two record streams are collected: one row per completed connection, and one row per worker event-loop iteration (a WST snapshot plus, for Micro-Hermes, the scheduler's per-stage survivor counts). Three metrics match the paper's: latency (mean and 99th percentile), throughput (completed connections per second), and load balance (the standard deviation of per-worker connection counts). The full pipeline, from benchmark execution to every figure and table below, is reproducible from a single Jupyter notebook in the repository.
 
+The paper's qualitative expectations were additionally written down as eight machine-checkable predicates before the benchmarks were run (for example: "Case 3: LIFO's open-connection SD exceeds three times either alternative's"), which the analysis notebook evaluates against every run. All eight hold for the simulation. For the eBPF version, seven hold and one fails: Micro-Hermes's Case 4 tail-latency advantage over reuseport is 1.40x where the predicate, calibrated in advance against the simulation's numbers, required 1.5x. The direction of the result is unchanged and the margin still widens with load; the threshold is reported as failing rather than quietly re-tuned.
+
 How the two benchmarks differ. Both versions ran exactly the same experiment: the same five cases, load levels, connection rates, cost distributions, injected stall and random seeds. This is what makes Section 8.6's comparison possible. But the two harnesses are not the same machinery, and three differences matter when reading their numbers side by side.
 
 The first and most important is what "latency" measures. In the simulation everything happens inside one process. Latency is the time from a connection being handed to a worker to the worker finishing the work, with no network, no socket and no connection setup involved. In the eBPF version latency is measured by the load generator, a separate process, from sending a request over a real connection to receiving the reply, and so includes connection establishment, the kernel's networking stack, and process scheduling. Client-side measurement was chosen because it is what a real user of a load balancer experiences.
 
-The second is that a real connection can be refused or reset; these outcomes are recorded but excluded from latency statistics. The third concerns Case 5: the simulation's burst reaches whichever connections happen to be open at 2.5 seconds, roughly 150, while the eBPF version fires on all 240 it holds, so the two Case 5 medians describe differently sized events.
+The second is that a real connection can be refused or reset; these outcomes are recorded but excluded from latency statistics. The third concerns Case 5: the simulation's burst reaches whichever connections happen to be open at 2.5 seconds, 150 or 151 depending on the trial, while the eBPF version fires on all 240 it holds, so the two Case 5 medians describe differently sized events.
 
 The consequence is that the two versions may be compared on rankings and on trends as load rises, but not by putting one version's millisecond figure next to the other's.
 
-One simplification shared by both versions must be stated before any results. Both listen on a single port, where the system being replicated separates tenants by port and listens on roughly ten thousand (Section 2.1). This matters specifically for the epoll-exclusive baseline, whose dispatch cost grows with the number of ports while the other two policies' does not. Pan et al. give this as one of the two reasons epoll exclusive performs poorly in their Case 1. Both versions therefore test epoll exclusive in its most favourable configuration, and wherever it performs well below, that is a lower bound on its true cost. Section 8.6 returns to this.
+One simplification shared by both versions must be stated before any results. Both listen on a single port, where the system being replicated separates tenants by port and listens on the order of ten thousand (Section 2.1). This matters specifically for the epoll-exclusive baseline, whose dispatch cost grows with the number of ports while the other two policies' does not. Pan et al. give this as one of the two reasons epoll exclusive performs poorly in their Case 1. Both versions therefore test epoll exclusive in its most favourable configuration, and wherever it performs well below, that is a lower bound on its true cost. Section 8.6 returns to this.
 
 A second, smaller difference is that the simulation collects at most 4 events per loop iteration where the eBPF version collects up to 64 (the smaller limit stops the simulation's millisecond-scale processing stretching one iteration past the hang threshold, Section 7.5). The eBPF version can therefore spend much longer inside a single iteration, which is visible in its hang-detection trace (Section 8.4) and its sharper filter pruning (Section 8.5), but does not affect the per-connection latency or balance figures.
 
@@ -350,7 +352,7 @@ Caption: Simulation: 99th-percentile connection latency per policy (bars: mean o
 
 Case 1 (high CPS, low cost). Far below capacity, all three policies deliver essentially the same latency: every policy completes a typical connection in 1.3 ms. They differ sharply in fairness. Across the 1,200 connections of a run, Micro-Hermes distributes most evenly (a standard deviation of 14 connections between workers, against 29 for reuseport), while the epoll-exclusive model sends every single connection to the wait-queue head worker (520): each request finishes before the next arrives, so the head worker is always idle again in time to be woken next. Micro-Hermes's tail is marginally higher than the baselines' (99th percentile 1.9 ms against 1.4 ms), for a structural reason: Stage 3 never picks the single best worker, only hashes each connection to one of Stage 2's candidates, so a few connections land on a candidate momentarily busier than an excluded worker. This matches the paper's ranking, which places reuseport marginally ahead of Hermes when load is trivially light: worker-awareness has nothing to protect against yet, so its overhead shows up as pure cost.
 
-Case 2 (high CPS, high cost, with an injected hang). This case pushes offered load slightly past what the four workers can process, so queues grow throughout the run and latency is dominated by waiting. Awareness of worker status pays off directly: Micro-Hermes achieves a mean latency of 570 ms against reuseport's 784 ms, and a 99th percentile of 1,579 ms against 2,037 ms. The cause is simple: reuseport's hash does not know a worker is stalled, so it keeps sending roughly a quarter of new connections to the stalled worker for the duration of the stall, while Micro-Hermes routes around it. The epoll-exclusive model posts the lowest latency of all (mean 414 ms, revisited in Section 8.6).
+Case 2 (high CPS, high cost, with an injected hang). This case pushes offered load slightly past what the four workers can process, so queues grow throughout the run and latency is dominated by waiting. Awareness of worker status pays off directly: Micro-Hermes achieves a mean latency of 570 ms against reuseport's 784 ms, and a 99th percentile of 1,579 ms against 2,037 ms. The cause is simple: reuseport's hash does not know a worker is stalled, so it keeps sending a quarter of new connections to the stalled worker for the duration of the stall, while Micro-Hermes routes around it. The epoll-exclusive model posts the lowest latency of all (mean 414 ms, revisited in Section 8.6).
 
 Case 3 (low CPS, long-lived connections). This case reproduces the paper's headline production result. Because connections never close within the run, every dispatch decision is permanent and mistakes accumulate. Figure 4 shows balance as a trajectory over the run, and Figure 5 shows who ends up holding the work. The epoll-exclusive model ends with a standard deviation of 104 connections, the head worker holding all 240 while the other three hold none, against 15 for Micro-Hermes and 14 for reuseport. This is the same ordering the paper reports from production (3,200, 50 and 20 for exclusive, reuseport and Hermes respectively). Micro-Hermes matches rather than beats reuseport here; Section 8.7 discusses why parity is the faithful expectation in this synthetic setting.
 
@@ -362,13 +364,13 @@ Caption: Simulation: standard deviation of per-worker open-connection counts dur
 
 Caption: Simulation: connections handled per worker in Case 3, ranked busiest to least busy within each trial (bars: mean over trials; error bars: min–max; dashed line: even share).]
 
-Case 4 (low CPS, high cost). With expensive requests at moderate utilisation (about 75%), the danger is queueing a new connection behind a slow worker which is already busy. Micro-Hermes avoids this: its 99th-percentile latency of 442 ms is less than half of reuseport's 975 ms, which hashes blindly. The epoll-exclusive model again leads (295 ms), with Micro-Hermes tracking it as the paper predicts: Hermes's status detection reacts with a small delay where exclusive reacts immediately.
+Case 4 (low CPS, high cost). With expensive requests at moderate utilisation (74%), the danger is queueing a new connection behind a slow worker which is already busy. Micro-Hermes avoids this: its 99th-percentile latency of 442 ms is less than half of reuseport's 975 ms, which hashes blindly. The epoll-exclusive model again leads (295 ms), with Micro-Hermes tracking it as the paper predicts: Hermes's status detection reacts with a small delay where exclusive reacts immediately.
 
-Case 5 (synchronised burst on long-lived connections). Cases 1 to 4 measure the latency of new connections, which cannot show why concentration is dangerous: a worker hoarding idle connections pays no visible penalty while they stay idle. Case 5 repeats Case 3's accumulation (roughly 150 open connections by 2.5 seconds) and then fires one 5 ms follow-up request on every open connection at the same instant, modelling the synchronised bursts (a market opening, a mass push notification) that the WST's connection count exists to guard against. Because a request on an established connection can only be processed by the worker that owns it, the burst is processed exactly as unevenly as the connections were dispatched. Under the epoll-exclusive model the head worker owns every connection and works through the entire backlog alone: the median follow-up waits 405 ms and the 99th percentile 801 ms. Micro-Hermes and reuseport, having spread the same connections across all four workers, complete the burst with a median of 107 ms and a 99th percentile of roughly 250 ms (Figure 6). The epoll-exclusive model's fast dispatch in Cases 2 and 4 coexists with a standing liability that comes due the moment its hoarded connections wake up.
+Case 5 (synchronised burst on long-lived connections). Cases 1 to 4 measure the latency of new connections, which cannot show why concentration is dangerous: a worker hoarding idle connections pays no visible penalty while they stay idle. Case 5 repeats Case 3's accumulation (151 open connections by 2.5 seconds; 150 in one trial) and then fires one 5 ms follow-up request on every open connection at the same instant, modelling the synchronised bursts (a market opening, a mass push notification) that the WST's connection count exists to guard against. Because a request on an established connection can only be processed by the worker that owns it, the burst is processed exactly as unevenly as the connections were dispatched. Under the epoll-exclusive model the head worker owns every connection and works through the entire backlog alone: the median follow-up waits 405 ms and the 99th percentile 801 ms. Micro-Hermes and reuseport, having spread the same connections across all four workers, complete the burst with a median of 107 ms and 99th percentiles of 259 ms and 241 ms respectively (Figure 6). The epoll-exclusive model's fast dispatch in Cases 2 and 4 coexists with a standing liability that comes due the moment its hoarded connections wake up.
 
 [FIGURE 6 HERE — burst latency, simulation (regenerate from analysis/results)
 
-Caption: Simulation: latency of follow-up requests when every open connection fires one simultaneously (Case 5, ~150 open connections at burst time, trials pooled).]
+Caption: Simulation: latency of follow-up requests when every open connection fires one simultaneously (Case 5, 150 or 151 open connections at burst time, trials pooled).]
 
 Across all five cases Micro-Hermes never collapses. Where it is not the best policy it trails by a small margin, whereas each baseline fails badly in at least one regime. This adaptability, rather than outright victory in any single regime, is the core property claimed for the Hermes architecture, and the simulation reproduces it.
 
@@ -424,7 +426,7 @@ Case 3 (low CPS, long-lived connections). Latency is uniform across policies at 
 
 Case 4 (low CPS, high cost). With expensive requests, Micro-Hermes again beats reuseport across the board and the margin widens with load: at medium load its mean is 153.9 ms against 212.2 ms; at heavy load, 242.3 against 307.4 ms, with a 99th-percentile ratio of 1.57x (820.6 against 1,290.7 ms). Throughput follows: at heavy load Micro-Hermes completes 43.7 connections/s against reuseport's 40.4, because connections sent to already-busy workers wait rather than finish. Epoll exclusive again posts the lowest mean and tail of the three.
 
-Case 5 (synchronised burst). This is where epoll exclusive's low latency elsewhere is paid for. After the same accumulation of long-lived connections, every open connection fires one follow-up request simultaneously. Micro-Hermes completes the burst with a mean of 67.5 ms and a 99th percentile of 224.3 ms, with reuseport equivalent at 68.0 and 232.9 ms. Epoll exclusive takes 248.3 ms mean and 769.8 ms at the tail, roughly 3.4 times worse. The explanation is in the same data. Averaged over trials, the burst is served by 4.0 workers under Micro-Hermes and reuseport but only 2.0 under epoll exclusive. Half the machine sits idle while the other half works through a backlog it alone accumulated. No dispatch decision can fix this after the fact.
+Case 5 (synchronised burst). This is where epoll exclusive's low latency elsewhere is paid for. After the same accumulation of long-lived connections, every open connection fires one follow-up request simultaneously. Micro-Hermes completes the burst with a mean of 67.5 ms and a 99th percentile of 224.3 ms, with reuseport equivalent at 68.0 and 232.9 ms. Epoll exclusive takes 248.3 ms mean and 769.8 ms at the tail, 3.4 times worse. The explanation is in the same data. Averaged over trials, the burst is served by 4.0 workers under Micro-Hermes and reuseport but only 2.0 under epoll exclusive. Half the machine sits idle while the other half works through a backlog it alone accumulated. No dispatch decision can fix this after the fact.
 
 Taken together, the working system supports the same overall claim as the simulation, with one important addition. Micro-Hermes is never the worst policy when it matters, it holds the best tail latency under overload, balances connections an order of magnitude better than epoll exclusive, and avoids the burst liability entirely. But it is now clearly the worst choice in one specific regime, high volumes of cheap uniform work, for a reason intrinsic to the design rather than incidental to this implementation.
 
@@ -434,7 +436,7 @@ Case 2 injects a 400 ms stall into one worker mid-run, reproducing the kind of h
 
 In the simulation, the recorded scheduler decisions show it working as intended: in every trial the stalled worker is removed from the candidate bitmap within the 200 ms hang threshold of the stall starting (56-192 ms across trials), and readmitted within milliseconds of re-entering its loop. The exclusion happens in two steps: usually the load filters remove the worker almost immediately, because it stalls while still holding a batch of unprocessed events; the time filter then guarantees exclusion by 200 ms regardless, once the worker's loop-entry timestamp has gone stale.
 
-The eBPF version shows the same mechanism operating, and Figure 12 traces one episode end to end. The behaviour is messier than the simulation's, in an instructive way. The worker is excluded across the whole stall window, as designed, but is then excluded again, for far longer than the stall itself, while it works through the backlog that accumulated while it was frozen. Its pending-event count jumps to nearly thirty immediately after recovery and takes well over a second to drain. Recovery from a hang is not instantaneous once the hang ends, because the worker is still overloaded. The scheduler treats it accordingly, which is correct behaviour that the simulation's cleaner picture understated.
+The eBPF version shows the same mechanism operating, and Figure 12 traces one episode end to end. The behaviour is messier than the simulation's, in an instructive way. The worker is excluded across the whole stall window, as designed, but is then excluded again, for far longer than the stall itself, while it works through the backlog that accumulated while it was frozen. Its pending-event count jumps to 26 immediately after recovery and takes 1.7 seconds to drain. Recovery from a hang is not instantaneous once the hang ends, because the worker is still overloaded. The scheduler treats it accordingly, which is correct behaviour that the simulation's cleaner picture understated.
 
 [FIGURE 12 HERE — analysis/figures/fig5_hang_detection.pdf
 
@@ -496,7 +498,7 @@ Fifth, a cost the original paper reports only as a percentage: the mechanism's o
 
 The central limitation is that processing is simulated in both versions. A worker sleeps for its connection's assigned cost rather than performing real Layer 7 work such as a TLS handshake. The dispatch machinery in the eBPF version is entirely real, but the paper's CPU-overhead percentages express a ratio of overhead to useful work, and this system has no useful work to measure against.
 
-Three further limitations follow from the evaluation's scale and workload. Four workers on one machine with three trials per point establish orderings and trends, not production performance figures. The connections are synthetic and uniform within each case, which is why Micro-Hermes matches rather than beats reuseport on balance in Case 3: a stateless hash only degrades when connection lifetimes vary widely (Section 8.7). And both versions listen on a single port where the real system uses roughly ten thousand, which removes a cost that falls on the epoll-exclusive baseline alone and leaves the mean-latency comparison against it unsettled (Sections 8.1 and 8.6).
+Three further limitations follow from the evaluation's scale and workload. Four workers on one machine with three trials per point establish orderings and trends, not production performance figures. The connections are synthetic and uniform within each case, which is why Micro-Hermes matches rather than beats reuseport on balance in Case 3: a stateless hash only degrades when connection lifetimes vary widely (Section 8.7). And both versions listen on a single port where the real system uses on the order of ten thousand, which removes a cost that falls on the epoll-exclusive baseline alone and leaves the mean-latency comparison against it unsettled (Sections 8.1 and 8.6).
 
 Finally, two of Hermes's production subsystems are out of scope entirely - the proactive termination of connections already pinned to a hung worker, and the cluster-level detection and scaling that handle node-wide overload. Both address failures that a single node's dispatch decisions cannot fix.
 
@@ -512,84 +514,7 @@ Beyond these, implementing the two subsystems noted as out of scope above would 
 
 The broader conclusion is encouraging for replication research as a carefully written systems paper with no released code contained enough architectural detail to rebuild both its behaviour and its costs. Where the reimplementation diverged from expectation, the divergences were explicable and in one instance corrected a conclusion drawn from the simulation alone. That correction is the strongest practical argument for carrying a replication through to a working system rather than stopping at making a model. Status-aware dispatch of the Hermes kind is not tied to hyperscale infrastructure: it is a small, portable idea, three shared counters, two filters and a bitmap, and this project makes available to anyone.
 
-Appendix A: Testing Summary
-
-Correctness was established at three levels: unit tests over the algorithmic components, benchmark-driven validation of whole-system behaviour against the paper's predictions, and integrity checks in the analysis pipeline.
-
-Each level targets specific requirements from Chapter 3. FR1-FR3 (the WST and the two algorithms) have the most precise published specification and receive direct unit tests. FR4-FR6 (the event loop, the baselines and the workload generator) are behavioural, and are verified through the whole-system predicates, which would fail if any of them misbehaved. FR7 (metrics recording) is verified by the pipeline's data-integrity checks, and NFR1 (lock-free concurrency) by the ring-buffer tests.
-
-The 17 unit tests (run with cargo test) cover: the scheduler's three filters, including hang detection and readmission, cold-start permissiveness, average-plus-theta pruning and theta's floor; the dispatcher's reciprocal_scale (matching the kernel's implementation exactly), Nth-set-bit selection and fallback rule; the simulation's epoll-exclusive model (the eBPF version needs no equivalent, since the kernel provides the mechanism); and the shared-memory ring's ordering, overflow rejection and index wrap-around. The scheduler's tests carry over to the eBPF version unmodified, because the scheduler itself does, confirming the design boundary described in Section 6.1.
-
-Whole-system validation is benchmark driven. The paper's qualitative expectations were written down as eight machine-checkable predicates before the benchmarks were run (for example: "Case 3: LIFO's open-connection SD exceeds three times either alternative's"), and the analysis notebook evaluates them against every run. Data integrity is asserted at load time: every policy × case × load × trial combination must be present, with no negative latencies.
-
-All eight predicates hold for the simulation. For the eBPF version, seven hold and one fails: Micro-Hermes's Case 4 tail-latency advantage over reuseport is 1.40x where the predicate, calibrated in advance against the simulation's numbers, required 1.5x. The direction of the result is unchanged and the margin still widens with load; the threshold is reported as failing rather than quietly re-tuned.
-
-Debugging relied on the VERBOSE per-iteration trace and the per-run console summary, whose per-worker counts must reconcile with the generator's totals; both artefacts recorded in Section 7.5 were found through these traces. The eBPF version's per-run script additionally fails loudly if the load balancer exits before it is listening, rather than silently producing an empty result file.
-
-Appendix B: User Manual
-
-The two versions are built and run separately: the simulation runs on any Unix-like system, while the eBPF version requires Linux, because it loads a program into the kernel.
-
-Part 1: The Simulation
-
-Requirements. A stable Rust toolchain; the analysis pipeline additionally needs Python 3 with pandas, numpy, matplotlib and Jupyter.
-
-Building and running a single simulation, from the phase1/ directory:
-
-    cargo run --release
-
-Configuration is via environment variables:
-
-    POLICY         hermes | lifo | reuseport      (default: hermes)
-    WORKLOAD_CASE  1 | 2 | 3 | 4 | 5 | default    (default: default)
-    LOAD           light | medium | heavy         (default: the
-                   case's characteristic level)
-    SEED           integer; varies the connection stream between
-                   trials	              (default: 0)
-    METRICS_PATH   per-iteration tick CSV   (default: metrics.csv)
-    CONNS_PATH     per-connection CSV       (default: conns.csv)
-    VERBOSE        1 to print every worker loop iteration
-
-For example, the overloaded compression-heavy case under the Hermes policy:
-
-    POLICY=hermes WORKLOAD_CASE=2 LOAD=heavy cargo run --release
-
-Each run prints a summary and writes the two CSVs. Unit tests run with `cargo test`.
-
-The full benchmark matrix (3 policies × {4 cases × 3 load levels + Case 5} × 3 trials, roughly 8 minutes) is driven by `analysis/run_benchmarks.sh`, which writes per-run CSVs into `analysis/results/`, skipping existing files so an interrupted run can be resumed.
-
-Part 2: The eBPF Version
-
-Requirements. Linux (developed on current Ubuntu). Beyond the Rust toolchain, compiling the kernel program needs the nightly toolchain with `rust-src` and the `bpf-linker` tool:
-
-    rustup toolchain install nightly --component rust-src
-    cargo install cargo-binstall && cargo binstall bpf-linker
-
-Loading a program into the kernel requires administrator privileges, so the benchmark scripts start the load balancer under `sudo` for every policy.
-
-Building both binaries from the repository root:
-
-    cargo build --release -p hermes -p hermes-bench
-
-Running one benchmark point end to end (starts the load balancer, runs the load generator against it, shuts it down):
-
-    benchmark/run_case.sh <policy> <case> <load> <trial>
-
-The full matrix, matching the simulation's:
-
-    benchmark/run_all.sh          # 3 trials
-    TRIALS=5 benchmark/run_all.sh # more trials for tighter error bars
-
-Results are written to `benchmark/results/`: per-connection records from the load generator plus per-iteration records from each worker.
-
-Part 3: Regenerating Figures and Tables
-
-    cd analysis && jupyter lab hermes_analysis.ipynb
-    # then: Kernel → Restart & Run All
-
-The notebook regenerates all figures (`analysis/figures/`) and tables (`analysis/tables/`) from whichever results directory its `RESULTS_DIR` points at: `analysis/results/` for the simulation, `benchmark/results/` for the eBPF version. The output paths are shared, so regenerating one version's artefacts overwrites the other's unless the output is redirected.
-
-Appendix C: Ethics Self-Assessment
+Appendix A: Ethics Self-Assessment
 
 [todo: attach the completed School of Computer Science ethics self-assessment / preliminary ethics form here, as referenced in Chapter 5.]
 

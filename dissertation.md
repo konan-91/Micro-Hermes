@@ -48,7 +48,7 @@ O4. Extend the evaluation beyond the paper with a scenario that directly measure
 
 O5. Port the dispatch path to a real eBPF program attached via SO_ATTACH_REUSEPORT_EBPF using the Aya toolchain, giving each worker a real listening socket and running the baselines as the kernel's own mechanisms rather than as models of them.
 
-All five objectives were met: O1, O2 and O4 in full, and O3 with two deviations from the paper's rankings whose explanations the eBPF version later put to the test, confirming one and refuting the other (Section 8.6). Completing O5, scoped as could-have because it alone requires a running Linux kernel and code accepted by the kernel's own safety checker (Chapter 3), turns the project from a study of the architecture into a working implementation of it, with baselines that are the kernel's own behaviour rather than models written by the author.
+All five objectives were met: O1, O2 and O4 in full, and O3 with two deviations from the paper's rankings whose explanations the eBPF version later put to the test, confirming one and refuting the other (Section 8.6). Completing O5, scoped as could-have because it alone requires a running Linux kernel and code accepted by the kernel's own safety checker (Chapter 3), turns the project from a study of the architecture into a working implementation of it.
 
 1.4 Report Structure
 

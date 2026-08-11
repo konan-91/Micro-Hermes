@@ -1,15 +1,6 @@
-//! hermes-bench: real-socket load generator, the phase-2 replacement for
-//! phase 1's in-process `generator.rs`. Talks real TCP to a running
-//! `hermes` LB (any policy — this binary doesn't know or care which; that
-//! only affects which worker ends up serving each connection, which shows
-//! up in the `worker_id` column via the wire protocol's echoed response).
-//!
-//! Usage: `hermes-bench --host 127.0.0.1 --port 7878 --case 2 --load heavy
-//! --seed 1 --label hermes --out conns.csv`
-//!
-//! See `benchmark/run_case.sh` for the orchestration that starts the LB
-//! (with the matching `HERMES_HANG_INJECT` for Case 2), waits for it to be
-//! ready, runs this, then stops the LB and collects both CSVs.
+//! Load generator. Talks real TCP to a running hermes LB under any
+//! policy. See benchmark/run_case.sh for the orchestration that starts
+//! the LB, runs this against it and collects both CSVs
 
 mod client;
 mod workload;
@@ -26,12 +17,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 use workload::{LoadLevel, WorkloadCase, WorkloadConfig};
 
-/// A completed run stays finite even for "forever" connection lifetimes
-/// (Cases 3/5, lifetime = 60s): every connection is closed at
-/// `min(lifetime, duration + GRACE)` after generator start. GRACE just
-/// needs to comfortably cover the last wave's request/response and, for
-/// Case 5, the burst (which the paper's profile fires well before
-/// `duration` anyway).
+/// Every connection closes at min(lifetime, duration + GRACE) after
+/// generator start, so runs with 60s lifetimes (Cases 3 and 5) still
+/// finish promptly. GRACE just has to cover the last wave's round trip
 const GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Parser, Debug)]
@@ -43,23 +31,21 @@ struct Cli {
     #[arg(long, default_value_t = hermes_common::DEFAULT_PORT)]
     port: u16,
 
-    /// Workload case: 1|2|3|4|5, or omit for a quick mixed smoke-test profile
+    /// Workload case 1|2|3|4|5, or omit for a quick smoke-test profile
     #[arg(long)]
     case: Option<String>,
 
-    /// Load level within the case: light|medium|heavy (default: the case's
+    /// Load level, light|medium|heavy (defaults to the case's
     /// characteristic level, see workload.rs)
     #[arg(long)]
     load: Option<String>,
 
-    /// Perturbs the synthetic per-connection cost sequence so repeated
-    /// trials draw different (but reproducible) service times
+    /// Perturbs the per-connection cost sequence so repeated trials draw
+    /// different but reproducible service times
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
-    /// Free-text tag written into the label column (e.g. the LB policy
-    /// under test) so results from different runs can be told apart after
-    /// concatenation
+    /// Tag written into the label column (e.g. the policy under test)
     #[arg(long, default_value = "run")]
     label: String,
 
@@ -110,21 +96,15 @@ async fn main() -> Result<()> {
     while next_arrival.duration_since(gen_start) < cfg.duration {
         tokio::time::sleep_until(next_arrival).await;
 
-        // Synthetic 4-tuple-hash stand-in: a counter xor'd with the
-        // scrambled seed, mixed by Knuth's constant — same construction as
-        // phase 1's generator.rs, kept only to sample the cost
-        // distribution deterministically (it never reaches the wire: the
-        // real 4-tuple hash Algorithm 2 uses is computed by the kernel
-        // from the actual TCP connection).
+        // Deterministic stand-in for the 4-tuple hash, used only to
+        // sample the cost distribution. The hash Algorithm 2 actually
+        // sees is computed by the kernel from the real connection
         let hash = (conn_id ^ cli.seed.wrapping_mul(0xff51afd7ed558ccd)).wrapping_mul(0x9e3779b97f4a7c15);
         let service_us = cfg.service.sample(hash).as_micros() as u32;
 
-        // Detached (not tracked by a JoinSet): completion is observed
-        // indirectly via `collect()` below, which only returns once every
-        // task's `tx` clone has dropped — i.e. once every task, each
-        // bounded by `close_at`, has finished. A panicking task still
-        // drops its clone during unwind, so this can't hang; tokio's
-        // default panic hook logs the panic to stderr either way.
+        // Detached tasks. collect() only returns once every task's tx
+        // clone has dropped, and a panicking task still drops its clone
+        // during unwind, so this can't hang
         tokio::spawn(run_connection(
             addr, conn_id, service_us, close_at, cfg.burst, clock_start, gen_start, label.clone(), tx.clone(),
         ));
@@ -163,10 +143,8 @@ struct Summary {
     max_us: i64,
 }
 
-/// Streams every row to `path` as it arrives and accumulates latencies for
-/// a final summary. Uses blocking `std::fs` I/O from within the task: at
-/// these row rates (thousands, not millions, per run) the occasional
-/// blocking write is not worth the extra complexity of `tokio::fs`.
+/// Streams rows to the CSV as they arrive and accumulates latencies for
+/// the summary. Blocking file I/O is fine at these row rates
 async fn collect(path: PathBuf, mut rx: mpsc::UnboundedReceiver<ConnRow>) -> Result<Summary> {
     let file = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     let mut w = BufWriter::new(file);

@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
-# Full benchmark matrix: 3 policies x 5 cases x (3 load levels for cases
-# 1-4, 1 for case 5) x TRIALS, driven through run_case.sh — the phase-2
-# analogue of phase 1's analysis/run_benchmarks.sh, same output naming
-# convention so the existing notebook needs minimal changes to read either.
+# Full benchmark matrix, 3 policies x 5 cases x load levels x TRIALS,
+# driven through run_case.sh. Each point starts and stops a real hermes
+# process under sudo, so run `sudo -v` first to avoid repeated prompts.
 #
-# Each run_case.sh invocation starts and stops a real `hermes` process
-# under sudo, so this is much slower per-point than phase 1's in-process
-# runs (expect real process startup/eBPF-attach/shutdown overhead on every
-# point, not just once). Run `sudo -v` first so sudo's credential cache
-# covers the whole matrix instead of prompting repeatedly.
+# Usage  ./run_all.sh            (3 trials)
+#        TRIALS=5 ./run_all.sh   (more trials for tighter error bars)
 #
-# Usage:  ./run_all.sh            # 3 trials
-#         TRIALS=5 ./run_all.sh   # more trials for tighter error bars
-#
-# Idempotent: existing result files are skipped, so a partial/interrupted
-# run can be resumed; delete benchmark/results/ to force a full re-run.
+# Existing result files are skipped so an interrupted run can be resumed.
+# Delete benchmark/results/ to force a full re-run
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,14 +15,9 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$SCRIPT_DIR/results"
 TRIALS="${TRIALS:-3}"
 
-# Prime sudo's credential cache so the matrix doesn't prompt per-point. This
-# is a best-effort latency optimisation only: `sudo -v` needs a controlling
-# terminal, which it doesn't have when this script runs non-interactively
-# (e.g. backgrounded, or under sudo-rs on Ubuntu where `-v` is terminal-only).
-# In those setups a passwordless sudoers rule for the `hermes` binary is what
-# actually authorises each start, so a failure here is non-fatal — the real
-# `sudo -E ... hermes` calls in run_case.sh still succeed. Don't let it trip
-# `set -e`.
+# Prime sudo's credential cache, best effort only. Non-interactive runs
+# rely on a NOPASSWD sudoers rule instead, so don't let a failure here
+# trip set -e
 echo "[bench] priming sudo credential cache (best-effort; needed for every 'hermes' start)"
 sudo -v 2>/dev/null || echo "[bench] sudo -v unavailable (non-interactive / sudo-rs); relying on NOPASSWD sudoers rule"
 

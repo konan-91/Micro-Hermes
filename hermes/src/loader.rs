@@ -1,31 +1,14 @@
-//! Kernel-facing setup: the real counterpart of phase 1's `dispatcher.rs`.
+//! Socket setup and eBPF loading for each policy.
 //!
-//! Phase 1's `Policy` enum picked between three *simulated* dispatch
-//! mechanisms in userspace. In phase 2 only one of those three is code we
-//! write at all — `reuseport` and `lifo` are the kernel's own
-//! `SO_REUSEPORT` hash and `EPOLLEXCLUSIVE` wait-queue behaviour, selected
-//! here purely by which *socket topology* we hand to the workers. `hermes`
-//! additionally loads and attaches the real eBPF program from
-//! `hermes-ebpf`.
+//! hermes and reuseport use N distinct SO_REUSEPORT sockets bound to the
+//! same port, one per worker. The kernel's 4-tuple hash picks among them
+//! by default, and under hermes the attached eBPF program overrides that
+//! pick with Algorithm 2. lifo uses a single shared socket which every
+//! worker adds to its own epoll with EPOLLEXCLUSIVE, giving the real
+//! wait-queue behaviour the baseline describes (§2.2).
 //!
-//! ## Socket topology per policy
-//!
-//! - `hermes` / `reuseport`: N distinct sockets, each with `SO_REUSEPORT`,
-//!   all bound to the same port. Every worker owns exactly one (its own
-//!   column in `M_socket`). The kernel's stateless 4-tuple hash picks among
-//!   them by default; under `hermes` the attached eBPF program overrides
-//!   that pick using Algorithm 2 (`hermes-ebpf/src/main.rs`).
-//! - `lifo`: **one** socket, no `SO_REUSEPORT`. Every worker adds it to its
-//!   own epoll instance with `EPOLLEXCLUSIVE`. This *is* the real
-//!   `EPOLLEXCLUSIVE` mechanism the paper's baseline describes (§2.2): the
-//!   kernel's wait-queue is genuinely shared and genuinely LIFO (insertion
-//!   at the head, wakeup stops at the first idle waiter) — nothing here
-//!   simulates that, it falls out of the kernel doing what it always does.
-//!
-//! All sockets are created here, in the loader, **before** `fork()`. Each
-//! forked child inherits the whole fd table, so worker *i* already has
-//! `listen_fds[i]` open in its own process with no fd-passing required —
-//! see `main.rs`.
+//! All sockets are created before fork(), so each worker inherits its
+//! listen fd with no fd-passing needed
 
 use anyhow::{Context, Result};
 use aya::maps::ReusePortSockArray;
@@ -36,13 +19,11 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
-    /// Full Hermes: Algorithm 1 in workers (`worker::schedule_and_sync`) +
-    /// Algorithm 2 in the attached eBPF program.
+    /// Algorithm 1 in workers plus Algorithm 2 in the eBPF program
     Hermes,
-    /// Baseline: real `EPOLLEXCLUSIVE` wait-queue wakeup.
+    /// Baseline, real EPOLLEXCLUSIVE wait-queue wakeup
     Lifo,
-    /// Baseline: real `SO_REUSEPORT` stateless 4-tuple hash, no eBPF
-    /// program attached at all.
+    /// Baseline, the default SO_REUSEPORT hash with no eBPF attached
     Reuseport,
 }
 
@@ -64,28 +45,23 @@ impl Policy {
         }
     }
 
-    /// Whether workers under this policy run Algorithm 1 and publish M_Sel.
+    /// Whether workers run Algorithm 1 and publish M_Sel
     pub fn runs_scheduler(&self) -> bool {
         matches!(self, Policy::Hermes)
     }
 }
 
-/// Socket setup, ready to fork workers over. `listen_fds[i]` is the fd
-/// worker `i` should `epoll_ctl`-register and `accept4` from. Under `lifo`
-/// every entry is the *same* fd (see module docs); under `hermes` /
-/// `reuseport` each is distinct.
+/// Socket setup ready to fork workers over. listen_fds[i] is the fd worker
+/// i registers and accepts from. Under lifo every entry is the same fd
 pub struct Setup {
     pub listen_fds: Vec<RawFd>,
-    /// Kept open for the loader process's lifetime so the fds stay valid
-    /// until every worker has forked and inherited its own copy. Dropped
-    /// (closed) once the parent itself exits; harmless either way since
-    /// each worker's inherited copy keeps the underlying socket alive
-    /// independently (see module docs on fork semantics).
+    /// Kept open in the parent so the fds stay valid until every worker
+    /// has forked and inherited its own copy
     _owned: Vec<OwnedFd>,
 }
 
-/// Build the socket topology for `policy` and, for `Policy::Hermes`, load
-/// and attach the eBPF program. Must be called before `fork()`.
+/// Build the sockets for `policy` and, under hermes, load and attach the
+/// eBPF program. Must be called before fork()
 pub fn setup(policy: Policy, port: u16) -> Result<Setup> {
     let setup = match policy {
         Policy::Hermes | Policy::Reuseport => {
@@ -108,12 +84,10 @@ pub fn setup(policy: Policy, port: u16) -> Result<Setup> {
     Ok(setup)
 }
 
-/// Create a TCP listener with `SO_REUSEADDR` (always, for fast restarts)
-/// and, if `reuseport`, `SO_REUSEPORT` — which must be set **before**
-/// `bind(2)`: the kernel only admits a socket into a reuseport group at
-/// bind time, and setting the option afterward is silently ignored. This
-/// is exactly why `std::net::TcpListener` can't be used here: it offers no
-/// hook between `socket(2)` and `bind(2)`.
+/// Create a nonblocking TCP listener. SO_REUSEPORT must be set before
+/// bind(2), the kernel only admits a socket into a reuseport group at bind
+/// time. That is also why std's TcpListener can't be used here, it offers
+/// no hook between socket(2) and bind(2)
 fn create_listener(port: u16, reuseport: bool) -> Result<OwnedFd> {
     use std::os::fd::FromRawFd;
 
@@ -144,8 +118,7 @@ fn create_listener(port: u16, reuseport: bool) -> Result<OwnedFd> {
             return Err(std::io::Error::last_os_error()).context(format!("bind(2) to port {port}"));
         }
 
-        // Backlog: kernel accept queue depth (analogue of phase 1's
-        // QUEUE_CAP). 1024 is generous for the CPS levels in workload.rs.
+        // 1024 backlog is generous for the CPS levels in workload.rs
         if libc::listen(fd.as_raw_fd(), 1024) != 0 {
             return Err(std::io::Error::last_os_error()).context("listen(2)");
         }
@@ -171,12 +144,10 @@ fn set_sockopt_bool(fd: &OwnedFd, opt: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-/// Load `hermes-ebpf`, pin `M_Sel`/`M_socket` under `BPFFS_DIR` (so workers
-/// can reopen them after `fork()` with no fd-passing, see `worker.rs`),
-/// populate `M_socket` with every worker's listening socket, load the
-/// `SK_REUSEPORT` program, and attach it to the reuseport group via any one
-/// of the sockets (attaching through one socket in a group attaches to the
-/// whole group — see `SkReuseport::attach` docs).
+/// Load hermes-ebpf, pin its maps under BPFFS_DIR so workers can reopen
+/// them after fork(), populate M_socket with every worker's listener, then
+/// load and attach the SK_REUSEPORT program. Attaching through one socket
+/// attaches to the whole reuseport group
 fn load_and_attach_ebpf(listen_fds: &[RawFd]) -> Result<()> {
     bump_memlock_rlimit()?;
     std::fs::create_dir_all(BPFFS_DIR)
@@ -194,8 +165,7 @@ fn load_and_attach_ebpf(listen_fds: &[RawFd]) -> Result<()> {
         .context("M_socket is not a BPF_MAP_TYPE_REUSEPORT_SOCKARRAY")?;
 
     for (worker_id, &fd) in listen_fds.iter().enumerate() {
-        // SAFETY: `fd` is one of our own listener fds, guaranteed open for
-        // the duration of this call (owned by `Setup` in the caller).
+        // fd is one of our own listeners, kept open by the caller
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         socket_array
             .set(worker_id as u32, &borrowed, 0)
@@ -220,18 +190,13 @@ fn load_and_attach_ebpf(listen_fds: &[RawFd]) -> Result<()> {
         hermes_common::PIN_M_SEL,
     );
 
-    // `ebpf` (and with it the loader's own fds for the program/maps) is
-    // dropped here. That's safe: the program stays attached to the
-    // reuseport group as long as its sockets exist (owned by our caller,
-    // then inherited by every forked worker), and the maps stay reachable
-    // because they're pinned to bpffs, not because this handle is alive.
+    // Dropping ebpf here is fine. The program stays attached as long as
+    // the sockets exist and the maps stay reachable through their pins
     Ok(())
 }
 
-/// Bump `RLIMIT_MEMLOCK` to unlimited. Needed on kernels that still charge
-/// eBPF map memory against the old memlock rlimit instead of memcg
-/// (pre-5.11-ish; see https://lwn.net/Articles/837122/). Harmless no-op on
-/// newer kernels.
+/// Bump RLIMIT_MEMLOCK to unlimited. Kernels before ~5.11 charge eBPF map
+/// memory against it. Harmless no-op on newer kernels
 fn bump_memlock_rlimit() -> Result<()> {
     let rlim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
@@ -244,13 +209,9 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
-/// Best-effort cleanup of pinned eBPF state, called by the loader on a
-/// clean shutdown so repeated runs don't see stale pins. Not called on a
-/// crash/kill -9, in which case `rm -rf /sys/fs/bpf/hermes` by hand (or
-/// just rebooting / a fresh `bpffs` mount) is the manual recovery step —
-/// the pins are inert once no process reopens them, they don't keep the
-/// program attached (that's tied to the sockets, which die with the
-/// workers) and don't leak kernel memory once removed.
+/// Remove pinned eBPF state on clean shutdown so repeated runs don't see
+/// stale pins. Not called after a crash, in which case remove
+/// /sys/fs/bpf/hermes by hand
 pub fn cleanup_pins() {
     if let Err(e) = std::fs::remove_dir_all(BPFFS_DIR) {
         if e.kind() != std::io::ErrorKind::NotFound {

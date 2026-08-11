@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Mechanical Markdown -> Word converter for dissertation.md.
+Markdown to Word converter for dissertation.md.
 
-Does NOT rewrite, summarize, or regenerate any prose. It only:
-  - splits the source into paragraph blocks on blank lines,
-  - classifies each block as a heading (exact string match against the
-    document's own Table of Contents listing), a code block (4+ space
-    indented run), or a plain paragraph,
-  - writes each block's ORIGINAL text into a python-docx paragraph/run
-    unchanged, applying only visual styling (bold/colour/font).
+Splits the source into blocks on blank lines, classifies each as a
+heading, a code block (4+ space indented) or a paragraph, and writes the
+original text into python-docx unchanged, applying only styling.
 
-Run verify_docx.py afterwards to confirm every character of body text in
-the .md made it into the .docx untouched.
+Run verify_docx.py afterwards to confirm the body text made it across
+untouched.
 """
 import re
 import sys
@@ -34,7 +30,7 @@ CHAPTER_RE = re.compile(r"^\d+\.\s")
 SECTION_RE = re.compile(r"^\d+\.\d+\s")
 APPENDIX_RE = re.compile(r"^Appendix [A-Z]:")
 
-# Headings that appear exactly once in the source (front-matter labels).
+# front-matter labels, each appearing exactly once in the source
 SINGLE_HEADINGS = {"Abstract", "Declaration", "Table of Contents"}
 
 
@@ -52,8 +48,7 @@ def classify_heading_level(text: str) -> int | None:
 def read_blocks(lines: list[str]):
     """Yield (kind, text_or_lines) blocks, splitting on blank lines.
 
-    kind is 'code' for a run of 4+-space-indented lines (merged, original
-    text preserved line by line), otherwise 'line' for a single line.
+    kind is 'code' for a run of 4+-space-indented lines, otherwise 'line'.
     """
     i = 0
     n = len(lines)
@@ -103,9 +98,8 @@ def set_update_fields_on_open(document):
 def main():
     raw_lines = SRC.read_text(encoding="utf-8").splitlines()
 
-    # --- Front matter destined for the title page (pulled out of the body,
-    # per the user's explicit request for a separate title page). These are
-    # the first four non-blank lines of the source file.
+    # the first four non-blank lines become the title page and are pulled
+    # out of the body
     front_matter = []
     body_start = 0
     for idx, l in enumerate(raw_lines):
@@ -120,7 +114,7 @@ def main():
 
     document = Document()
 
-    # ---------------- Title page ----------------
+    # title page
     section = document.sections[0]
     section.left_margin = Cm(2.5)
     section.right_margin = Cm(2.5)
@@ -156,7 +150,7 @@ def main():
 
     document.add_page_break()
 
-    # ---------------- Table of contents page ----------------
+    # table of contents page
     p = document.add_paragraph()
     r = p.add_run("Table of Contents")
     r.bold = True
@@ -169,7 +163,7 @@ def main():
 
     document.add_page_break()
 
-    # ---------------- Body ----------------
+    # body
     for kind, payload in read_blocks(body_lines):
         if kind == "code":
             p = document.add_paragraph()

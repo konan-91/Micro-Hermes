@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# Benchmark matrix runner for micro-hermes.
+# Benchmark matrix runner. Runs every POLICY x WORKLOAD_CASE x LOAD
+# combination TRIALS times, each trial with a distinct SEED, and writes
+# per-run tick and conn CSVs into analysis/results/. Cases 1-4 sweep three
+# load levels (Table 3), case 5 runs at a single level tagged "medium" for
+# filename uniformity.
 #
-# Runs every POLICY × WORKLOAD_CASE × LOAD combination TRIALS times (each
-# trial with a distinct SEED so the synthetic connection stream differs
-# reproducibly) and writes per-run CSVs into analysis/results/:
+# Usage  ./run_benchmarks.sh            (3 trials, about 8 min)
+#        TRIALS=5 ./run_benchmarks.sh   (more trials for tighter error bars)
 #
-#   {policy}_case{case}_{load}_trial{t}_ticks.csv — per-iteration WST snapshots
-#   {policy}_case{case}_{load}_trial{t}_conns.csv — per-connection latency rows
-#
-# Cases 1-4 sweep three offered-load levels (light/medium/heavy), mirroring
-# the paper's Table 3. Case 5 (the burst-evidence scenario) runs at a single
-# level, tagged "medium" for filename uniformity.
-#
-# Usage:  ./run_benchmarks.sh            # 3 trials (≈ 8 min total)
-#         TRIALS=5 ./run_benchmarks.sh   # more trials for tighter error bars
-#
-# Idempotence: existing result files are skipped, so a partial run can be
-# resumed; delete analysis/results/ to force a full re-run.
+# Existing result files are skipped so a partial run can be resumed.
+# Delete analysis/results/ to force a full re-run
 
 set -euo pipefail
 
@@ -57,7 +50,7 @@ for trial in $(seq 1 "$TRIALS"); do
       done
     done
   done
-  # Case 5: single level (our extension, outside the paper's sweep).
+  # case 5 runs at a single level, outside the paper's sweep
   for policy in hermes lifo reuseport; do
     run_one "$trial" 5 medium "$policy"
   done

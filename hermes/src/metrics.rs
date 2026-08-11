@@ -1,21 +1,8 @@
-//! Tick metrics: one CSV row per worker event-loop iteration (WST snapshot,
-//! Algorithm-1 stage survivors + bitmap). Drives the balance-over-time
-//! plots (paper Fig. 13) exactly like phase 1's `metrics.rs`.
-//!
-//! What's different from phase 1: connection *latency* is no longer
-//! measured here at all. In phase 1 the worker was the only thing that
-//! could see arrival/dequeue/done timestamps (everything lived in one
-//! mmap). In phase 2 the client (`hermes-bench`) makes a real TCP
-//! connection and can time its own request/response round trip directly —
-//! a strictly better measurement (it's what the connection's actual user
-//! experiences), so `hermes-bench` owns the conns CSV entirely and this
-//! module only ever produces ticks.
-//!
-//! Streaming, not buffered: phase 1's worker ran for a fixed benchmark
-//! duration and wrote its shard once at exit. This worker is a long-running
-//! server, so `TickWriter` opens its file up front and appends one line per
-//! iteration with a periodic flush, rather than accumulating an unbounded
-//! `Vec` for the lifetime of the process.
+//! Tick metrics, one CSV row per worker loop iteration (WST snapshot plus
+//! Algorithm 1 stage counts and bitmap). Drives the balance-over-time
+//! plots (Fig. 13). Latency is measured client-side by hermes-bench, so
+//! this module only produces ticks. Rows are streamed with a periodic
+//! flush since the worker is a long-running server
 
 use crate::loader::Policy;
 use crate::scheduler::ScheduleResult;
@@ -30,16 +17,15 @@ pub struct TickRow {
     pub worker_id: usize,
     pub iter: u32,
     pub snapshots: [WorkerSnapshot; NUM_WORKERS],
-    /// Connections this worker currently holds open (real socket count,
-    /// replaces phase 1's simulated `queue_len`).
+    /// Connections this worker currently holds open
     pub open_conns: usize,
-    /// Algorithm-1 output, `None` for the baselines (no userspace scheduler).
+    /// Algorithm 1 output, None for the baselines
     pub result: Option<ScheduleResult>,
     pub policy: Policy,
 }
 
 impl TickRow {
-    /// One console line per iteration (enabled with `--verbose`).
+    /// One console line per iteration (--verbose)
     pub fn print(&self) {
         let fmt_metric = |f: fn(&WorkerSnapshot) -> i64| {
             self.snapshots.iter().map(|s| format!("{:>3}", f(s))).collect::<Vec<_>>().join(" ")
@@ -77,8 +63,8 @@ pub fn tick_header() -> String {
 }
 
 fn format_tick_row(row: &TickRow) -> String {
-    // Baselines have no Algorithm-1 output; write zeros so the schema is
-    // uniform across policies (simplifies pandas-side comparison).
+    // baselines have no Algorithm 1 output, write zeros so the schema is
+    // uniform across policies
     let (bitmap, s1, s2, s3) = match &row.result {
         Some(r) => (r.bitmap, r.after_stage1, r.after_stage2, r.after_stage3),
         None => (0, 0, 0, 0),
@@ -108,9 +94,8 @@ fn format_tick_row(row: &TickRow) -> String {
     line
 }
 
-/// Streaming per-worker tick writer: one file per worker (`w{id}_ticks.csv`,
-/// see `main.rs`), flushed every `FLUSH_EVERY` rows so a `kill -9` during a
-/// long run loses at most a fraction of a second of data, not the whole file.
+/// Per-worker tick writer, one file per worker, flushed every FLUSH_EVERY
+/// rows so a kill -9 loses at most a fraction of a second of data
 pub struct TickWriter {
     writer: BufWriter<File>,
     pending: u32,

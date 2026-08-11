@@ -1,21 +1,8 @@
-//! Workload definitions: the four traffic profiles from the paper (§10),
-//! plus Case 5. Ported from phase 1's `workload.rs` — the traffic-side
-//! numbers (CPS, cost distributions, lifetimes) are unchanged, since those
-//! describe the experiment, not the simulation. Two things did change
-//! shape:
-//!
-//! - `HangSpec` moved to the `hermes` crate (worker-side), since injecting
-//!   a hang means making a specific *worker process* stall — this process
-//!   only ever sees the LB from the outside, over real sockets, so it has
-//!   no way to reach into a worker directly. Case 2's hang is instead
-//!   applied by setting `HERMES_HANG_INJECT` on the LB process itself
-//!   (see `hermes/src/main.rs`); the orchestration script
-//!   (`benchmark/run_case.sh`) sets both sides consistently.
-//! - `lifetime` now bounds how long *this client* keeps a connection open,
-//!   not a worker-side close timer — see `Client::close_at` in
-//!   `client.rs`, which additionally caps it at the run duration plus a
-//!   short grace period so a 60s "long-lived connection" profile doesn't
-//!   make an automated benchmark run hang for 60s.
+//! The paper's four traffic profiles (§10) plus Case 5. The traffic-side
+//! numbers match the phase 1 simulator. Case 2's hang is injected on the
+//! LB side via HERMES_HANG_INJECT since this process can't reach into a
+//! worker, and lifetime bounds how long this client keeps a connection
+//! open (capped in client.rs so a 60s profile doesn't stall the run)
 
 use std::time::Duration;
 
@@ -24,8 +11,8 @@ use std::time::Duration;
 pub enum ProcessingTime {
     /// Fixed duration (uniform cheap requests)
     Fixed(Duration),
-    /// Bimodal: most connections fast, some slow, models the paper's highly
-    /// variable per-connection L7 cost (SSL handshakes, compression)
+    /// Bimodal, most connections fast, some slow, modelling variable
+    /// per-connection L7 cost (SSL handshakes, compression)
     Bimodal {
         fast: Duration,
         slow: Duration,
@@ -35,8 +22,7 @@ pub enum ProcessingTime {
 }
 
 impl ProcessingTime {
-    /// Draw a sample. Deterministic in `seed` (no rand crate needed), same
-    /// SplitMix64-style scramble as phase 1 so runs stay reproducible.
+    /// Draw a sample, deterministic in seed so runs are reproducible
     pub fn sample(&self, seed: u64) -> Duration {
         match self {
             ProcessingTime::Fixed(d) => *d,
@@ -47,7 +33,7 @@ impl ProcessingTime {
     }
 }
 
-/// Offered-load level within a case, mirroring the paper's Table 3 sweep.
+/// Offered load level within a case (paper Table 3)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadLevel {
     Light,
@@ -89,9 +75,8 @@ impl WorkloadCase {
     }
 }
 
-/// A synchronized burst of follow-up requests: at time `at` (relative to
-/// generator start), every connection this client still holds open fires
-/// one follow-up request over its existing socket.
+/// At time `at` (relative to generator start) every connection still held
+/// open fires one follow-up request over its existing socket
 #[derive(Debug, Clone, Copy)]
 pub struct BurstSpec {
     pub at: Duration,
@@ -117,9 +102,8 @@ impl WorkloadConfig {
         Self::for_case_with_load(case, level)
     }
 
-    /// The Table-3 sweep: per-case CPS at each load level. Utilization
-    /// figures are offered load / capacity, with capacity ~ 4 worker-sec/sec
-    /// (NUM_WORKERS workers).
+    /// Per-case CPS at each load level (Table 3 sweep). Capacity is about
+    /// 4 worker-seconds of processing per second
     pub fn for_case_with_load(case: WorkloadCase, load: LoadLevel) -> Self {
         let mut config = Self::base_case(case);
         config.cps = match case {
@@ -157,9 +141,8 @@ impl WorkloadConfig {
                 lifetime: Duration::from_millis(150),
                 burst: None,
             },
-            // Note: the paper's Case 2 also injects a worker hang partway
-            // through (Stage-1 exercise). That's applied on the LB side via
-            // HERMES_HANG_INJECT, not here — see module docs.
+            // Case 2 also injects a worker hang, applied on the LB side
+            // via HERMES_HANG_INJECT rather than here
             WorkloadCase::Case2 => WorkloadConfig {
                 cps: 100,
                 duration: Duration::from_secs(4),

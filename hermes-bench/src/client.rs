@@ -1,12 +1,6 @@
-//! Per-connection client task: the real counterpart of phase 1's role for
-//! each dispatched connection (`phase1/src/worker.rs`'s per-event handling,
-//! seen from the *client* side of a real socket instead of a shared-memory
-//! queue).
-//!
-//! One `tokio` task per connection. Each task: connects, sends the initial
-//! request, times the round trip, then — if this is a Case-5-style
-//! workload — waits for either its own close deadline or the synchronized
-//! burst deadline, whichever comes first, exactly once.
+//! One tokio task per connection. Each task connects, sends the initial
+//! request, times the round trip, and for Case 5 fires one burst
+//! follow-up before its close deadline
 
 use hermes_common::{decode_response, encode_request, REQUEST_HEADER_LEN, RESPONSE_LEN};
 use std::net::SocketAddr;
@@ -19,18 +13,14 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::workload::BurstSpec;
 
-/// One row of the conns CSV: a completed (or failed) request, timed
-/// end-to-end from this client's own clock. This is what phase 1 could
-/// never measure directly (it had no real client) and is a strictly better
-/// latency signal: it's what a real caller of the load balancer would see.
+/// One row of the conns CSV, a completed or failed request timed end to
+/// end on the client's own clock
 #[derive(Debug, Clone)]
 pub struct ConnRow {
     pub conn_id: u64,
     pub seq: u32,
-    /// "accept" (the connection's first request) | "burst" (Case-5
-    /// follow-up) | "error" (connect/write/read failed) | "drop" (connect
-    /// itself failed, e.g. backlog full — the real analogue of phase 1's
-    /// simulated accept-queue overflow).
+    /// "accept" for the first request, "burst" for a Case 5 follow-up,
+    /// "error" for a failed read/write, "drop" for a failed connect
     pub kind: &'static str,
     pub worker_id: Option<u32>,
     pub send_ns: i64,
@@ -98,10 +88,8 @@ pub async fn run_connection(
     let mut seq = 1u32;
     let mut burst_fired = false;
     loop {
-        // tokio::select!'s `if` guard short-circuits: when false, the
-        // branch's future expression is never evaluated, so `.unwrap()` on
-        // a `None` burst deadline is never reached (idiomatic pattern for
-        // an "optional timer" branch — see the tokio::select! docs).
+        // The if guard means the burst branch's future is never created
+        // when burst is None, so the unwrap below can't be reached
         let burst_active = !burst_fired && burst.is_some();
         tokio::select! {
             _ = tokio::time::sleep_until(close_at) => break,
@@ -146,10 +134,9 @@ async fn fire_request(
     true
 }
 
-/// Nanoseconds since `clock_start`. `send_ns`/`recv_ns` only ever get
-/// compared against each other on *this* client's own clock (the server
-/// just echoes the bits back unchanged), so a plain `Instant` delta is all
-/// that's needed — no wall-clock or cross-process clock sync required.
+/// Nanoseconds since clock_start. send_ns and recv_ns are only ever
+/// compared against each other on this client's own clock, so a plain
+/// Instant delta is enough
 fn now_ns(clock_start: StdInstant) -> i64 {
     clock_start.elapsed().as_nanos() as i64
 }

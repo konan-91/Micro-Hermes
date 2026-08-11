@@ -1,22 +1,10 @@
 #!/usr/bin/env bash
-# Run one (policy, case, load, trial) benchmark point against the real LB:
-# start `hermes` (root, for eBPF under the hermes policy), wait for it to be
-# listening, run `hermes-bench` against it, stop `hermes`, collect both
-# sides' CSVs into benchmark/results/ with phase-1-compatible naming so the
-# existing analysis notebook's file-loading code needs minimal changes.
+# Run one (policy, case, load, trial) benchmark point against the real LB.
+# Starts hermes (root, for eBPF), waits until it is listening, runs
+# hermes-bench against it, stops the LB and collects both CSVs into
+# benchmark/results/ with phase-1-compatible naming.
 #
-# This replaces phase 1's single in-process run (fork() + shared memory):
-# the LB and the load generator are now two real, independently-running
-# processes talking over a real TCP port, exactly like the deployment this
-# is meant to validate.
-#
-# Usage: run_case.sh <policy> <case> <load> <trial> [seed]
-#   policy: hermes | reuseport | lifo
-#   case:   1 | 2 | 3 | 4 | 5
-#   load:   light | medium | heavy
-#   trial:  integer, used as part of the output filename and (with seed) to
-#           perturb hermes-bench's synthetic cost sequence
-#   seed:   defaults to `trial`
+# Usage  run_case.sh <policy> <case> <load> <trial> [seed]
 set -euo pipefail
 
 POLICY="${1:?policy: hermes|reuseport|lifo}"
@@ -41,10 +29,8 @@ if [[ ! -x "$BIN_DIR/hermes" || ! -x "$BIN_DIR/hermes-bench" ]]; then
     exit 1
 fi
 
-# Case 2 injects a worker hang (Stage-1 exercise, §10 Table). Only
-# meaningful under the hermes policy (the baselines have no hang-detection
-# to demonstrate) but harmless to set unconditionally otherwise too — the
-# LB just stalls worker 0 regardless of policy.
+# Case 2 injects a worker hang to exercise Stage 1. Harmless under the
+# baselines, worker 0 just stalls regardless of policy
 HANG_ENV=()
 if [[ "$CASE" == "2" ]]; then
     HANG_ENV=(HERMES_HANG_INJECT=0:1500:400)
@@ -63,8 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for the LB to actually be listening (root + eBPF load/attach under
-# the hermes policy can take a moment) rather than a fixed sleep.
+# wait until the LB is actually listening rather than a fixed sleep
 echo "[run_case] waiting for port $PORT..."
 for _ in $(seq 1 100); do
     if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then

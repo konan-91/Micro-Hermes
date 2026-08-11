@@ -118,23 +118,6 @@ def main():
     title_text, subtitle_text, student_text, university_text = front_matter
     body_lines = raw_lines[body_start:]
 
-    # --- Build ordered list of heading strings that appear TWICE (once in
-    # the manual "Table of Contents" listing, once as the real heading).
-    toc_idx = next(i for i, l in enumerate(body_lines) if l.strip() == "Table of Contents")
-    # The manual listing runs from just after "Table of Contents" until the
-    # line "1. Introduction" reappears a second time.
-    double_heading_texts = []
-    j = toc_idx + 1
-    while True:
-        line = body_lines[j].strip()
-        if line != "":
-            double_heading_texts.append(line)
-            if line == "References":
-                break
-        j += 1
-
-    seen_count = {t: 0 for t in double_heading_texts}
-
     document = Document()
 
     # ---------------- Title page ----------------
@@ -205,15 +188,7 @@ def main():
         if text == "":
             continue
 
-        level = None
-        if text in SINGLE_HEADINGS:
-            level = 1
-        elif text in seen_count:
-            seen_count[text] += 1
-            if seen_count[text] == 2:
-                level = classify_heading_level(text)
-            else:
-                level = None  # first occurrence: it's inside the manual ToC listing
+        level = classify_heading_level(text)
 
         if level == 1:
             p = document.add_paragraph(style="Heading 1")

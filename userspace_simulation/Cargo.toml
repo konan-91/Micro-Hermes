@@ -1,0 +1,12 @@
+[package]
+name = "micro-hermes"
+version = "0.1.0"
+edition = "2021"
+description = "Userspace simulation of Hermes eBPF load balancing (Phase 1)"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "micro-hermes"
+path = "src/main.rs"
